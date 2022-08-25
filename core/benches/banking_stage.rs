@@ -50,7 +50,6 @@ use {
         vote_state::VoteStateUpdate, vote_transaction::new_vote_state_update_transaction,
     },
     std::{
-        iter::repeat_with,
         sync::{atomic::Ordering, Arc, RwLock},
         time::{Duration, Instant},
     },
@@ -61,8 +60,15 @@ fn check_txs(receiver: &Arc<Receiver<WorkingBankEntry>>, ref_tx_count: usize) {
     let mut total = 0;
     let now = Instant::now();
     loop {
-        if let Ok((_bank, (entry, _tick_height))) = receiver.recv_timeout(Duration::new(1, 0)) {
-            total += entry.transactions.len();
+        if let Ok(WorkingBankEntry {
+            bank: _,
+            entries_ticks,
+        }) = receiver.recv_timeout(Duration::new(1, 0))
+        {
+            total += entries_ticks
+                .iter()
+                .map(|e| e.0.transactions.len())
+                .sum::<usize>();
         }
         if total >= ref_tx_count {
             break;
@@ -299,7 +305,6 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             None,
             Arc::new(ConnectionCache::new("connection_cache_test")),
             bank_forks,
-            &Arc::new(PrioritizationFeeCache::new(0u64)),
         );
 
         let chunk_len = verified.len() / CHUNKS;
