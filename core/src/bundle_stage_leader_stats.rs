@@ -1,3 +1,4 @@
+use crate::leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker;
 use {
     crate::leader_slot_banking_stage_timing_metrics::LeaderExecuteAndCommitTimings,
     solana_poh::poh_recorder::BankStart,
@@ -5,60 +6,23 @@ use {
     solana_sdk::{clock::Slot, saturating_add_assign},
 };
 
-// Stats emitted only during leader slots
-#[derive(Default)]
-pub struct BundleStageLeaderSlotTrackingMetrics {
-    pub(crate) current_slot: Option<Slot>,
-    bundle_stage_leader_stats: BundleStageLeaderStats,
-}
-
-impl BundleStageLeaderSlotTrackingMetrics {
-    pub fn maybe_report(&mut self, id: u32, bank_start: &Option<&BankStart>) {
-        match (self.current_slot, bank_start) {
-            // not was leader, not is leader
-            (None, None) => {}
-            // was leader, not leader anymore
-            (Some(current_slot), None) => {
-                self.bundle_stage_leader_stats.report(id, current_slot);
-                self.bundle_stage_leader_stats = BundleStageLeaderStats::default();
-            }
-            // was leader, is leader
-            (Some(current_slot), Some(bank_start)) => {
-                if current_slot != bank_start.working_bank.slot() {
-                    self.bundle_stage_leader_stats.report(id, current_slot);
-                    self.bundle_stage_leader_stats = BundleStageLeaderStats::default();
-                }
-            }
-            // not was leader, is leader
-            (None, Some(_)) => {
-                self.bundle_stage_leader_stats = BundleStageLeaderStats::default();
-            }
-        }
-
-        self.current_slot = bank_start
-            .as_ref()
-            .map(|bank_start| bank_start.working_bank.slot());
-    }
-
-    pub fn bundle_stage_leader_stats(&mut self) -> &mut BundleStageLeaderStats {
-        &mut self.bundle_stage_leader_stats
-    }
-}
-
-#[derive(Default)]
 pub struct BundleStageLeaderStats {
-    transaction_errors: TransactionErrorMetrics,
-    execute_and_commit_timings: LeaderExecuteAndCommitTimings,
+    id: u32,
     bundle_stage_stats: BundleStageStats,
+    leader_slot_metrics_tracker: LeaderSlotMetricsTracker,
 }
 
 impl BundleStageLeaderStats {
-    pub fn transaction_errors(&mut self) -> &mut TransactionErrorMetrics {
-        &mut self.transaction_errors
+    pub fn new(id: u32) -> Self {
+        Self {
+            id,
+            bundle_stage_stats: BundleStageStats::default(),
+            leader_slot_metrics_tracker: LeaderSlotMetricsTracker::new(id),
+        }
     }
 
-    pub fn execute_and_commit_timings(&mut self) -> &mut LeaderExecuteAndCommitTimings {
-        &mut self.execute_and_commit_timings
+    pub fn leader_slot_metrics_tracker(&mut self) -> &mut LeaderSlotMetricsTracker {
+        &mut self.leader_slot_metrics_tracker
     }
 
     pub fn bundle_stage_stats(&mut self) -> &mut BundleStageStats {
@@ -66,9 +30,7 @@ impl BundleStageLeaderStats {
     }
 
     pub fn report(&self, id: u32, slot: Slot) {
-        self.transaction_errors.report(id, slot);
-        self.execute_and_commit_timings.report(id, slot);
-        self.bundle_stage_stats.report(id, slot);
+        // self.bundle_stage_stats.report(id, slot);
     }
 }
 

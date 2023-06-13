@@ -1,3 +1,5 @@
+use crate::bundle_stage::BundleStageLoopStats;
+use crate::bundle_stage_leader_stats::BundleStageLeaderStats;
 use {
     crate::{
         banking_stage::{committer::Committer, BankingStageStats},
@@ -30,12 +32,12 @@ impl BundleConsumer {
         }
     }
 
-    pub fn consume_bundles(
+    pub fn consume_buffered_bundles(
         &self,
         bank_start: &BankStart,
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
-        banking_stage_stats: &BankingStageStats,
-        slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+        bundle_stage_stats: &BundleStageLoopStats,
+        bundle_stage_leader_stats: &mut BundleStageLeaderStats,
     ) {
     }
 }

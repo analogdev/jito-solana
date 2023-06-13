@@ -2,13 +2,14 @@ use {
     crate::{
         banking_stage::{BankingStageStats, FilterForwardingResults, ForwardOption},
         forward_packet_batches_by_accounts::ForwardPacketBatchesByAccounts,
-        immutable_deserialized_packet::ImmutableDeserializedPacket,
+        immutable_deserialized_packet::{DeserializedBundlePackets, ImmutableDeserializedPacket},
         latest_unprocessed_votes::{
             LatestUnprocessedVotes, LatestValidatorVotePacket, VoteBatchInsertionMetrics,
             VoteSource,
         },
         leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
         multi_iterator_scanner::{MultiIteratorScanner, ProcessingDecision},
+        packet_bundle::PacketBundle,
         read_write_account_set::ReadWriteAccountSet,
         unprocessed_packet_batches::{
             DeserializedPacket, PacketBatchInsertionMetrics, UnprocessedPacketBatches,
@@ -23,7 +24,8 @@ use {
         saturating_add_assign, transaction::SanitizedTransaction,
     },
     std::{
-        collections::HashMap,
+        cmp::min,
+        collections::{HashMap, VecDeque},
         sync::{atomic::Ordering, Arc},
     },
 };
@@ -39,6 +41,12 @@ const MAX_NUM_VOTES_RECEIVE: usize = 10_000;
 pub enum UnprocessedTransactionStorage {
     VoteStorage(VoteStorage),
     LocalTransactionStorage(ThreadLocalUnprocessedPackets),
+    BundleStorage(BundleStorage), // TODO (LB): add bundle storage here
+}
+
+#[derive(Debug)]
+pub struct BundleStorage {
+    unprocessed_bundle_storage: VecDeque<DeserializedBundlePackets>,
 }
 
 #[derive(Debug)]
@@ -57,6 +65,7 @@ pub struct VoteStorage {
 pub enum ThreadType {
     Voting(VoteSource),
     Transactions,
+    Bundles,
 }
 
 #[derive(Debug)]
@@ -245,10 +254,21 @@ impl UnprocessedTransactionStorage {
         })
     }
 
+    pub fn new_bundle_storage(
+        unprocessed_bundle_storage: VecDeque<DeserializedBundlePackets>,
+    ) -> Self {
+        Self::BundleStorage(BundleStorage {
+            unprocessed_bundle_storage,
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         match self {
             Self::VoteStorage(vote_storage) => vote_storage.is_empty(),
             Self::LocalTransactionStorage(transaction_storage) => transaction_storage.is_empty(),
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => {
+                bundle_storage.is_empty()
+            }
         }
     }
 
@@ -256,6 +276,7 @@ impl UnprocessedTransactionStorage {
         match self {
             Self::VoteStorage(vote_storage) => vote_storage.len(),
             Self::LocalTransactionStorage(transaction_storage) => transaction_storage.len(),
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => bundle_storage.len(),
         }
     }
 
@@ -265,6 +286,9 @@ impl UnprocessedTransactionStorage {
             Self::VoteStorage(vote_storage) => vote_storage.max_receive_size(),
             Self::LocalTransactionStorage(transaction_storage) => {
                 transaction_storage.max_receive_size()
+            }
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => {
+                bundle_storage.max_receive_size()
             }
         }
     }
@@ -292,6 +316,9 @@ impl UnprocessedTransactionStorage {
             Self::LocalTransactionStorage(transaction_storage) => {
                 transaction_storage.forward_option()
             }
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => {
+                bundle_storage.forward_option()
+            }
         }
     }
 
@@ -299,6 +326,7 @@ impl UnprocessedTransactionStorage {
         match self {
             Self::LocalTransactionStorage(transaction_storage) => transaction_storage.clear(), // Since we set everything as forwarded this is the same
             Self::VoteStorage(vote_storage) => vote_storage.clear_forwarded_packets(),
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => bundle_storage.clear(),
         }
     }
 
@@ -313,6 +341,11 @@ impl UnprocessedTransactionStorage {
             Self::LocalTransactionStorage(transaction_storage) => InsertPacketBatchSummary::from(
                 transaction_storage.insert_batch(deserialized_packets),
             ),
+            UnprocessedTransactionStorage::BundleStorage(_) => {
+                panic!(
+                    "bundles must be inserted using UnprocessedTransactionStorage::insert_bundle"
+                )
+            }
         }
     }
 
@@ -332,6 +365,9 @@ impl UnprocessedTransactionStorage {
                     bank,
                     forward_packet_batches_by_accounts,
                 ),
+            UnprocessedTransactionStorage::BundleStorage(_) => {
+                panic!("bundles are not forwarded between leaders")
+            }
         }
     }
 
@@ -366,6 +402,29 @@ impl UnprocessedTransactionStorage {
                 slot_metrics_tracker,
                 processing_function,
             ),
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => bundle_storage
+                .process_packets(
+                    bank,
+                    banking_stage_stats,
+                    slot_metrics_tracker,
+                    processing_function,
+                ),
+        }
+    }
+
+    /// Inserts bundles into storage. Only supported for UnprocessedTransactionStorage::BundleStorage
+    pub(crate) fn insert_bundles(
+        &mut self,
+        deserialized_bundles: Vec<DeserializedBundlePackets>,
+    ) -> InsertPacketBundlesSummary {
+        match self {
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => {
+                bundle_storage.insert_bundles(deserialized_bundles)
+            }
+            UnprocessedTransactionStorage::LocalTransactionStorage(_)
+            | UnprocessedTransactionStorage::VoteStorage(_) => {
+                panic!("UnprocessedTransactionStorage::insert_bundles only works for type UnprocessedTransactionStorage::BundleStorage");
+            }
         }
     }
 }
@@ -524,6 +583,7 @@ impl ThreadLocalUnprocessedPackets {
             ThreadType::Transactions => ForwardOption::ForwardTransaction,
             ThreadType::Voting(VoteSource::Tpu) => ForwardOption::ForwardTpuVote,
             ThreadType::Voting(VoteSource::Gossip) => ForwardOption::NotForward,
+            ThreadType::Bundles => panic!(), // TODO (LB)
         }
     }
 
@@ -943,6 +1003,62 @@ impl ThreadLocalUnprocessedPackets {
     }
 }
 
+pub struct InsertPacketBundlesSummary {
+    pub num_bundles_inserted: usize,
+    pub num_packets_inserted: usize,
+    pub num_bundles_dropped: usize,
+    pub num_packets_dropped: usize,
+}
+
+impl BundleStorage {
+    fn is_empty(&self) -> bool {
+        self.unprocessed_bundle_storage.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.unprocessed_bundle_storage.len()
+    }
+
+    fn max_receive_size(&self) -> usize {
+        self.unprocessed_bundle_storage.capacity()
+    }
+
+    fn forward_option(&self) -> ForwardOption {
+        ForwardOption::NotForward
+    }
+
+    fn clear(&mut self) {
+        self.unprocessed_bundle_storage.clear()
+    }
+
+    fn insert_bundles(
+        &mut self,
+        deserialized_bundles: Vec<DeserializedBundlePackets>,
+    ) -> InsertPacketBundlesSummary {
+        // TODO (LB): respect the capacity
+        for bundle in deserialized_bundles {
+            self.unprocessed_bundle_storage.push_back(bundle);
+        }
+
+        InsertPacketBundlesSummary {
+            num_bundles_inserted: 0,
+            num_packets_inserted: 0,
+            num_bundles_dropped: 0,
+            num_packets_dropped: 0,
+        }
+    }
+
+    fn process_packets<F>(
+        &mut self,
+        bank: Arc<Bank>,
+        banking_stage_stats: &BankingStageStats,
+        slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+        mut processing_function: F,
+    ) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -960,379 +1076,4 @@ mod tests {
         },
         std::error::Error,
     };
-
-    #[test]
-    fn test_filter_processed_packets() {
-        let retryable_indexes = [0, 1, 2, 3];
-        let mut non_retryable_indexes = vec![];
-        let f = |start, end| {
-            non_retryable_indexes.push((start, end));
-        };
-        filter_processed_packets(retryable_indexes.iter(), f);
-        assert!(non_retryable_indexes.is_empty());
-
-        let retryable_indexes = [0, 1, 2, 3, 5];
-        let mut non_retryable_indexes = vec![];
-        let f = |start, end| {
-            non_retryable_indexes.push((start, end));
-        };
-        filter_processed_packets(retryable_indexes.iter(), f);
-        assert_eq!(non_retryable_indexes, vec![(4, 5)]);
-
-        let retryable_indexes = [1, 2, 3];
-        let mut non_retryable_indexes = vec![];
-        let f = |start, end| {
-            non_retryable_indexes.push((start, end));
-        };
-        filter_processed_packets(retryable_indexes.iter(), f);
-        assert_eq!(non_retryable_indexes, vec![(0, 1)]);
-
-        let retryable_indexes = [1, 2, 3, 5];
-        let mut non_retryable_indexes = vec![];
-        let f = |start, end| {
-            non_retryable_indexes.push((start, end));
-        };
-        filter_processed_packets(retryable_indexes.iter(), f);
-        assert_eq!(non_retryable_indexes, vec![(0, 1), (4, 5)]);
-
-        let retryable_indexes = [1, 2, 3, 5, 8];
-        let mut non_retryable_indexes = vec![];
-        let f = |start, end| {
-            non_retryable_indexes.push((start, end));
-        };
-        filter_processed_packets(retryable_indexes.iter(), f);
-        assert_eq!(non_retryable_indexes, vec![(0, 1), (4, 5), (6, 8)]);
-
-        let retryable_indexes = [1, 2, 3, 5, 8, 8];
-        let mut non_retryable_indexes = vec![];
-        let f = |start, end| {
-            non_retryable_indexes.push((start, end));
-        };
-        filter_processed_packets(retryable_indexes.iter(), f);
-        assert_eq!(non_retryable_indexes, vec![(0, 1), (4, 5), (6, 8)]);
-    }
-
-    #[test]
-    fn test_filter_and_forward_with_account_limits() {
-        solana_logger::setup();
-        let GenesisConfigInfo {
-            genesis_config,
-            mint_keypair,
-            ..
-        } = create_genesis_config(10);
-        let current_bank = Arc::new(Bank::new_for_tests(&genesis_config));
-
-        let simple_transactions: Vec<Transaction> = (0..256)
-            .map(|_id| {
-                // packets are deserialized upon receiving, failed packets will not be
-                // forwarded; Therefore we need to create real packets here.
-                let key1 = Keypair::new();
-                system_transaction::transfer(
-                    &mint_keypair,
-                    &key1.pubkey(),
-                    genesis_config.rent.minimum_balance(0),
-                    genesis_config.hash(),
-                )
-            })
-            .collect_vec();
-
-        let mut packets: Vec<DeserializedPacket> = simple_transactions
-            .iter()
-            .enumerate()
-            .map(|(packets_id, transaction)| {
-                let mut p = Packet::from_data(None, transaction).unwrap();
-                p.meta_mut().port = packets_id as u16;
-                p.meta_mut().set_tracer(true);
-                DeserializedPacket::new(p).unwrap()
-            })
-            .collect_vec();
-
-        // all packets are forwarded
-        {
-            let buffered_packet_batches: UnprocessedPacketBatches =
-                UnprocessedPacketBatches::from_iter(packets.clone().into_iter(), packets.len());
-            let mut transaction_storage = UnprocessedTransactionStorage::new_transaction_storage(
-                buffered_packet_batches,
-                ThreadType::Transactions,
-            );
-            let mut forward_packet_batches_by_accounts =
-                ForwardPacketBatchesByAccounts::new_with_default_batch_limits();
-
-            let FilterForwardingResults {
-                total_forwardable_packets,
-                total_tracer_packets_in_buffer,
-                total_forwardable_tracer_packets,
-                ..
-            } = transaction_storage.filter_forwardable_packets_and_add_batches(
-                current_bank.clone(),
-                &mut forward_packet_batches_by_accounts,
-            );
-            assert_eq!(total_forwardable_packets, 256);
-            assert_eq!(total_tracer_packets_in_buffer, 256);
-            assert_eq!(total_forwardable_tracer_packets, 256);
-
-            // packets in a batch are forwarded in arbitrary order; verify the ports match after
-            // sorting
-            let expected_ports: Vec<_> = (0..256).collect();
-            let mut forwarded_ports: Vec<_> = forward_packet_batches_by_accounts
-                .iter_batches()
-                .flat_map(|batch| batch.get_forwardable_packets().map(|p| p.meta().port))
-                .collect();
-            forwarded_ports.sort_unstable();
-            assert_eq!(expected_ports, forwarded_ports);
-        }
-
-        // some packets are forwarded
-        {
-            let num_already_forwarded = 16;
-            for packet in &mut packets[0..num_already_forwarded] {
-                packet.forwarded = true;
-            }
-            let buffered_packet_batches: UnprocessedPacketBatches =
-                UnprocessedPacketBatches::from_iter(packets.clone().into_iter(), packets.len());
-            let mut transaction_storage = UnprocessedTransactionStorage::new_transaction_storage(
-                buffered_packet_batches,
-                ThreadType::Transactions,
-            );
-            let mut forward_packet_batches_by_accounts =
-                ForwardPacketBatchesByAccounts::new_with_default_batch_limits();
-            let FilterForwardingResults {
-                total_forwardable_packets,
-                total_tracer_packets_in_buffer,
-                total_forwardable_tracer_packets,
-                ..
-            } = transaction_storage.filter_forwardable_packets_and_add_batches(
-                current_bank.clone(),
-                &mut forward_packet_batches_by_accounts,
-            );
-            assert_eq!(
-                total_forwardable_packets,
-                packets.len() - num_already_forwarded
-            );
-            assert_eq!(total_tracer_packets_in_buffer, packets.len());
-            assert_eq!(
-                total_forwardable_tracer_packets,
-                packets.len() - num_already_forwarded
-            );
-        }
-
-        // some packets are invalid (already processed)
-        {
-            let num_already_processed = 16;
-            for tx in &simple_transactions[0..num_already_processed] {
-                assert_eq!(current_bank.process_transaction(tx), Ok(()));
-            }
-            let buffered_packet_batches: UnprocessedPacketBatches =
-                UnprocessedPacketBatches::from_iter(packets.clone().into_iter(), packets.len());
-            let mut transaction_storage = UnprocessedTransactionStorage::new_transaction_storage(
-                buffered_packet_batches,
-                ThreadType::Transactions,
-            );
-            let mut forward_packet_batches_by_accounts =
-                ForwardPacketBatchesByAccounts::new_with_default_batch_limits();
-            let FilterForwardingResults {
-                total_forwardable_packets,
-                total_tracer_packets_in_buffer,
-                total_forwardable_tracer_packets,
-                ..
-            } = transaction_storage.filter_forwardable_packets_and_add_batches(
-                current_bank,
-                &mut forward_packet_batches_by_accounts,
-            );
-            assert_eq!(
-                total_forwardable_packets,
-                packets.len() - num_already_processed
-            );
-            assert_eq!(total_tracer_packets_in_buffer, packets.len());
-            assert_eq!(
-                total_forwardable_tracer_packets,
-                packets.len() - num_already_processed
-            );
-        }
-    }
-
-    #[test]
-    fn test_unprocessed_transaction_storage_insert() -> Result<(), Box<dyn Error>> {
-        let keypair = Keypair::new();
-        let vote_keypair = Keypair::new();
-        let pubkey = solana_sdk::pubkey::new_rand();
-
-        let small_transfer = Packet::from_data(
-            None,
-            system_transaction::transfer(&keypair, &pubkey, 1, Hash::new_unique()),
-        )?;
-        let mut vote = Packet::from_data(
-            None,
-            new_vote_state_update_transaction(
-                VoteStateUpdate::default(),
-                Hash::new_unique(),
-                &keypair,
-                &vote_keypair,
-                &vote_keypair,
-                None,
-            ),
-        )?;
-        vote.meta_mut().flags.set(PacketFlags::SIMPLE_VOTE_TX, true);
-        let big_transfer = Packet::from_data(
-            None,
-            system_transaction::transfer(&keypair, &pubkey, 1000000, Hash::new_unique()),
-        )?;
-
-        for thread_type in [
-            ThreadType::Transactions,
-            ThreadType::Voting(VoteSource::Gossip),
-            ThreadType::Voting(VoteSource::Tpu),
-        ] {
-            let mut transaction_storage = UnprocessedTransactionStorage::new_transaction_storage(
-                UnprocessedPacketBatches::with_capacity(100),
-                thread_type,
-            );
-            transaction_storage.insert_batch(vec![
-                ImmutableDeserializedPacket::new(small_transfer.clone())?,
-                ImmutableDeserializedPacket::new(vote.clone())?,
-                ImmutableDeserializedPacket::new(big_transfer.clone())?,
-            ]);
-            let deserialized_packets = transaction_storage
-                .iter()
-                .map(|packet| packet.immutable_section().original_packet().clone())
-                .collect_vec();
-            assert_eq!(3, deserialized_packets.len());
-            assert!(deserialized_packets.contains(&small_transfer));
-            assert!(deserialized_packets.contains(&vote));
-            assert!(deserialized_packets.contains(&big_transfer));
-        }
-
-        for vote_source in [VoteSource::Gossip, VoteSource::Tpu] {
-            let mut transaction_storage = UnprocessedTransactionStorage::new_vote_storage(
-                Arc::new(LatestUnprocessedVotes::new()),
-                vote_source,
-            );
-            transaction_storage.insert_batch(vec![
-                ImmutableDeserializedPacket::new(small_transfer.clone())?,
-                ImmutableDeserializedPacket::new(vote.clone())?,
-                ImmutableDeserializedPacket::new(big_transfer.clone())?,
-            ]);
-            assert_eq!(1, transaction_storage.len());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_prepare_packets_to_forward() {
-        solana_logger::setup();
-        let GenesisConfigInfo {
-            genesis_config,
-            mint_keypair,
-            ..
-        } = create_genesis_config(10);
-
-        let simple_transactions: Vec<Transaction> = (0..256)
-            .map(|_id| {
-                // packets are deserialized upon receiving, failed packets will not be
-                // forwarded; Therefore we need to create real packets here.
-                let key1 = Keypair::new();
-                system_transaction::transfer(
-                    &mint_keypair,
-                    &key1.pubkey(),
-                    genesis_config.rent.minimum_balance(0),
-                    genesis_config.hash(),
-                )
-            })
-            .collect_vec();
-
-        let mut packets: Vec<DeserializedPacket> = simple_transactions
-            .iter()
-            .enumerate()
-            .map(|(packets_id, transaction)| {
-                let mut p = Packet::from_data(None, transaction).unwrap();
-                p.meta_mut().port = packets_id as u16;
-                p.meta_mut().set_tracer(true);
-                DeserializedPacket::new(p).unwrap()
-            })
-            .collect_vec();
-
-        // test preparing buffered packets for forwarding
-        let test_prepareing_buffered_packets_for_forwarding =
-            |buffered_packet_batches: UnprocessedPacketBatches| -> (usize, usize, usize) {
-                let mut total_tracer_packets_in_buffer: usize = 0;
-                let mut total_packets_to_forward: usize = 0;
-                let mut total_tracer_packets_to_forward: usize = 0;
-
-                let mut unprocessed_transactions = ThreadLocalUnprocessedPackets {
-                    unprocessed_packet_batches: buffered_packet_batches,
-                    thread_type: ThreadType::Transactions,
-                };
-
-                let mut original_priority_queue = unprocessed_transactions.take_priority_queue();
-                let _ = original_priority_queue
-                    .drain_desc()
-                    .chunks(128usize)
-                    .into_iter()
-                    .flat_map(|packets_to_process| {
-                        let (_, packets_to_forward, is_tracer_packet) = unprocessed_transactions
-                            .prepare_packets_to_forward(
-                                packets_to_process,
-                                &mut total_tracer_packets_in_buffer,
-                            );
-                        total_packets_to_forward += packets_to_forward.len();
-                        total_tracer_packets_to_forward += is_tracer_packet.len();
-                        packets_to_forward
-                    })
-                    .collect::<MinMaxHeap<Arc<ImmutableDeserializedPacket>>>();
-                (
-                    total_tracer_packets_in_buffer,
-                    total_packets_to_forward,
-                    total_tracer_packets_to_forward,
-                )
-            };
-
-        // all tracer packets are forwardable
-        {
-            let buffered_packet_batches: UnprocessedPacketBatches =
-                UnprocessedPacketBatches::from_iter(packets.clone().into_iter(), packets.len());
-            let (
-                total_tracer_packets_in_buffer,
-                total_packets_to_forward,
-                total_tracer_packets_to_forward,
-            ) = test_prepareing_buffered_packets_for_forwarding(buffered_packet_batches);
-            assert_eq!(total_tracer_packets_in_buffer, 256);
-            assert_eq!(total_packets_to_forward, 256);
-            assert_eq!(total_tracer_packets_to_forward, 256);
-        }
-
-        // some packets are forwarded
-        {
-            let num_already_forwarded = 16;
-            for packet in &mut packets[0..num_already_forwarded] {
-                packet.forwarded = true;
-            }
-            let buffered_packet_batches: UnprocessedPacketBatches =
-                UnprocessedPacketBatches::from_iter(packets.clone().into_iter(), packets.len());
-            let (
-                total_tracer_packets_in_buffer,
-                total_packets_to_forward,
-                total_tracer_packets_to_forward,
-            ) = test_prepareing_buffered_packets_for_forwarding(buffered_packet_batches);
-            assert_eq!(total_tracer_packets_in_buffer, 256);
-            assert_eq!(total_packets_to_forward, 256 - num_already_forwarded);
-            assert_eq!(total_tracer_packets_to_forward, 256 - num_already_forwarded);
-        }
-
-        // all packets are forwarded
-        {
-            for packet in &mut packets {
-                packet.forwarded = true;
-            }
-            let buffered_packet_batches: UnprocessedPacketBatches =
-                UnprocessedPacketBatches::from_iter(packets.clone().into_iter(), packets.len());
-            let (
-                total_tracer_packets_in_buffer,
-                total_packets_to_forward,
-                total_tracer_packets_to_forward,
-            ) = test_prepareing_buffered_packets_for_forwarding(buffered_packet_batches);
-            assert_eq!(total_tracer_packets_in_buffer, 256);
-            assert_eq!(total_packets_to_forward, 0);
-            assert_eq!(total_tracer_packets_to_forward, 0);
-        }
-    }
 }

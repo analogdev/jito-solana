@@ -37,6 +37,12 @@ pub enum DeserializedPacketError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct DeserializedBundlePackets {
+    pub uuid: String,
+    pub packets: Vec<ImmutableDeserializedPacket>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct ImmutableDeserializedPacket {
     original_packet: Packet,
     transaction: SanitizedVersionedTransaction,
