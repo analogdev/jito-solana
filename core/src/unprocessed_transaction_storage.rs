@@ -45,11 +45,6 @@ pub enum UnprocessedTransactionStorage {
 }
 
 #[derive(Debug)]
-pub struct BundleStorage {
-    unprocessed_bundle_storage: VecDeque<DeserializedBundlePackets>,
-}
-
-#[derive(Debug)]
 pub struct ThreadLocalUnprocessedPackets {
     unprocessed_packet_batches: UnprocessedPacketBatches,
     thread_type: ThreadType,
@@ -69,7 +64,7 @@ pub enum ThreadType {
 }
 
 #[derive(Debug)]
-pub(crate) enum InsertPacketBatchSummary {
+pub enum InsertPacketBatchSummary {
     VoteBatchInsertionMetrics(VoteBatchInsertionMetrics),
     PacketBatchInsertionMetrics(PacketBatchInsertionMetrics),
 }
@@ -256,9 +251,11 @@ impl UnprocessedTransactionStorage {
 
     pub fn new_bundle_storage(
         unprocessed_bundle_storage: VecDeque<DeserializedBundlePackets>,
+        cost_model_failed_bundles: VecDeque<DeserializedBundlePackets>,
     ) -> Self {
         Self::BundleStorage(BundleStorage {
             unprocessed_bundle_storage,
+            cost_model_buffered_bundle_storage: cost_model_failed_bundles,
         })
     }
 
@@ -276,7 +273,9 @@ impl UnprocessedTransactionStorage {
         match self {
             Self::VoteStorage(vote_storage) => vote_storage.len(),
             Self::LocalTransactionStorage(transaction_storage) => transaction_storage.len(),
-            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => bundle_storage.len(),
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => {
+                bundle_storage.unprocessed_bundles_len()
+            }
         }
     }
 
@@ -326,7 +325,14 @@ impl UnprocessedTransactionStorage {
         match self {
             Self::LocalTransactionStorage(transaction_storage) => transaction_storage.clear(), // Since we set everything as forwarded this is the same
             Self::VoteStorage(vote_storage) => vote_storage.clear_forwarded_packets(),
-            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => bundle_storage.clear(),
+            UnprocessedTransactionStorage::BundleStorage(bundle_storage) => bundle_storage.reset(),
+        }
+    }
+
+    pub fn bundle_storage(&mut self) -> Option<&mut BundleStorage> {
+        match self {
+            UnprocessedTransactionStorage::BundleStorage(bundle_stoge) => Some(bundle_stoge),
+            _ => None,
         }
     }
 
@@ -1004,10 +1010,18 @@ impl ThreadLocalUnprocessedPackets {
 }
 
 pub struct InsertPacketBundlesSummary {
+    pub insert_packets_summary: InsertPacketBatchSummary,
     pub num_bundles_inserted: usize,
     pub num_packets_inserted: usize,
     pub num_bundles_dropped: usize,
-    pub num_packets_dropped: usize,
+}
+
+#[derive(Debug)]
+pub struct BundleStorage {
+    unprocessed_bundle_storage: VecDeque<DeserializedBundlePackets>,
+    // Storage for bundles that exceeded the cost model for the slot they were last attempted
+    // execution on
+    cost_model_buffered_bundle_storage: VecDeque<DeserializedBundlePackets>,
 }
 
 impl BundleStorage {
@@ -1015,8 +1029,26 @@ impl BundleStorage {
         self.unprocessed_bundle_storage.is_empty()
     }
 
-    fn len(&self) -> usize {
+    pub fn unprocessed_bundles_len(&self) -> usize {
         self.unprocessed_bundle_storage.len()
+    }
+
+    pub fn unprocessed_packets_len(&self) -> usize {
+        self.unprocessed_bundle_storage
+            .iter()
+            .map(|b| b.packets.len())
+            .sum()
+    }
+
+    fn cost_model_buffered_bundles_len(&self) -> usize {
+        self.cost_model_buffered_bundle_storage.len()
+    }
+
+    fn cost_model_buffered_packets_len(&self) -> usize {
+        self.cost_model_buffered_bundle_storage
+            .iter()
+            .map(|b| b.packets.len())
+            .sum()
     }
 
     fn max_receive_size(&self) -> usize {
@@ -1027,24 +1059,41 @@ impl BundleStorage {
         ForwardOption::NotForward
     }
 
-    fn clear(&mut self) {
-        self.unprocessed_bundle_storage.clear()
+    // TODO (LB): return how many were cleared out of cost model failed or unprocessed_bundle_storage
+    pub fn reset(&mut self) {
+        self.unprocessed_bundle_storage.clear();
+        self.cost_model_buffered_bundle_storage.clear();
     }
 
     fn insert_bundles(
         &mut self,
         deserialized_bundles: Vec<DeserializedBundlePackets>,
     ) -> InsertPacketBundlesSummary {
-        // TODO (LB): respect the capacity
+        let mut num_bundles_inserted: usize = 0;
+        let mut num_packets_inserted: usize = 0;
+        let mut num_bundles_dropped: usize = 0;
+        let mut num_packets_dropped: usize = 0;
+
         for bundle in deserialized_bundles {
-            self.unprocessed_bundle_storage.push_back(bundle);
+            if self.unprocessed_bundle_storage.capacity() == self.unprocessed_bundle_storage.len() {
+                saturating_add_assign!(num_bundles_dropped, 1);
+                saturating_add_assign!(num_packets_dropped, bundle.packets.len());
+            } else {
+                saturating_add_assign!(num_bundles_inserted, 1);
+                saturating_add_assign!(num_packets_inserted, bundle.packets.len());
+                self.unprocessed_bundle_storage.push_back(bundle);
+            }
         }
 
         InsertPacketBundlesSummary {
-            num_bundles_inserted: 0,
-            num_packets_inserted: 0,
-            num_bundles_dropped: 0,
-            num_packets_dropped: 0,
+            insert_packets_summary: PacketBatchInsertionMetrics {
+                num_dropped_packets: num_packets_dropped,
+                num_dropped_tracer_packets: 0,
+            }
+            .into(),
+            num_bundles_inserted,
+            num_packets_inserted,
+            num_bundles_dropped,
         }
     }
 

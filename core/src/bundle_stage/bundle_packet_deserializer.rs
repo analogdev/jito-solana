@@ -146,6 +146,9 @@ impl BundlePacketDeserializer {
             return None;
         }
 
+        // TODO (LB): should we run other basic packet-level checks here?
+        //  might be better early in block engine stage to avoid a DOS attack with extremely large bundles
+
         Some(DeserializedBundlePackets {
             uuid: bundle.bundle_id.to_string(),
             packets,

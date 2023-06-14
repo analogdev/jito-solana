@@ -1,13 +1,11 @@
 //! The `bundle_stage` processes bundles, which are list of transactions to be executed
 //! sequentially and atomically.
-use crate::banking_stage::decision_maker::BufferedPacketsDecision;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
 use {
     crate::{
         banking_stage::{
             committer::{CommitTransactionDetails, Committer},
             consumer::Consumer,
-            decision_maker::DecisionMaker,
+            decision_maker::{BufferedPacketsDecision, DecisionMaker},
             BatchedTransactionDetails,
         },
         bundle_account_locker::{BundleAccountLocker, BundleAccountLockerResult, LockedBundle},
@@ -68,7 +66,7 @@ use {
     std::{
         collections::{HashMap, HashSet, VecDeque},
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex, RwLock,
         },
         thread::{self, Builder, JoinHandle},
@@ -96,7 +94,6 @@ pub struct BundleStageLoopStats {
 
     // newly buffered
     newly_buffered_bundles_count: AtomicUsize,
-    newly_buffered_packets_count: AtomicUsize,
 
     // currently buffered
     current_buffered_bundles_count: AtomicUsize,
@@ -106,7 +103,6 @@ pub struct BundleStageLoopStats {
 
     // number of packets + bundles dropped during insertion
     num_bundles_dropped: AtomicUsize,
-    num_packets_dropped: AtomicUsize,
 
     // timings
     receive_and_buffer_bundles_elapsed_us: AtomicU64,
@@ -144,11 +140,6 @@ impl BundleStageLoopStats {
                     i64
                 ),
                 (
-                    "newly_buffered_packets_count",
-                    self.newly_buffered_packets_count.swap(0, Ordering::Relaxed) as i64,
-                    i64
-                ),
-                (
                     "current_buffered_bundles_count",
                     self.current_buffered_bundles_count
                         .swap(0, Ordering::Relaxed) as i64,
@@ -163,11 +154,6 @@ impl BundleStageLoopStats {
                 (
                     "num_bundles_dropped",
                     self.num_bundles_dropped.swap(0, Ordering::Relaxed) as i64,
-                    i64
-                ),
-                (
-                    "num_packets_dropped",
-                    self.num_packets_dropped.swap(0, Ordering::Relaxed) as i64,
                     i64
                 ),
                 (
@@ -193,14 +179,14 @@ impl BundleStageLoopStats {
 //     pub pre_balances: (TransactionBalances, TransactionTokenBalances),
 //     pub post_balances: (TransactionBalances, TransactionTokenBalances),
 // }
-//
-// struct BundleReservedSpace {
-//     current_tx_block_limit: u64,
-//     current_bundle_block_limit: u64,
-//     initial_allocated_cost: u64,
-//     unreserved_ticks: u64,
-// }
-//
+
+struct BundleReservedSpace {
+    current_tx_block_limit: u64,
+    current_bundle_block_limit: u64,
+    initial_allocated_cost: u64,
+    unreserved_ticks: u64,
+}
+
 // impl BundleReservedSpace {
 //     fn reset_reserved_cost(&mut self, working_bank: &Arc<Bank>) {
 //         self.current_tx_block_limit = self
@@ -309,7 +295,6 @@ impl BundleStage {
         const BUNDLE_STAGE_ID: u32 = 10_000;
         let poh_recorder = poh_recorder.clone();
         let cluster_info = cluster_info.clone();
-        let block_builder_fee_info = block_builder_fee_info.clone();
 
         let mut bundle_receiver = BundleReceiver::new(BUNDLE_STAGE_ID, bundle_receiver, bank_forks);
 
@@ -325,10 +310,16 @@ impl BundleStage {
             poh_recorder.read().unwrap().new_recorder(),
             QosService::new(BUNDLE_STAGE_ID),
             log_message_bytes_limit,
+            tip_manager,
+            bundle_account_locker,
+            block_builder_fee_info.clone(),
+            max_bundle_retry_duration,
         );
 
-        let unprocessed_bundle_storage =
-            UnprocessedTransactionStorage::new_bundle_storage(VecDeque::with_capacity(1_000));
+        let unprocessed_bundle_storage = UnprocessedTransactionStorage::new_bundle_storage(
+            VecDeque::with_capacity(1_000),
+            VecDeque::with_capacity(1_000),
+        );
 
         let bundle_thread = Builder::new()
             .name("solBundleStgTx".to_string())
@@ -340,11 +331,8 @@ impl BundleStage {
                     BUNDLE_STAGE_ID,
                     unprocessed_bundle_storage,
                     cluster_info,
-                    tip_manager,
-                    bundle_account_locker,
-                    max_bundle_retry_duration,
-                    block_builder_fee_info,
                     preallocated_bundle_cost,
+                    poh_recorder,
                     exit,
                 );
             })
@@ -361,117 +349,20 @@ impl BundleStage {
         id: u32,
         mut unprocessed_bundle_storage: UnprocessedTransactionStorage,
         cluster_info: Arc<ClusterInfo>,
-        tip_manager: TipManager,
-        bundle_account_locker: BundleAccountLocker,
-        max_bundle_retry_duration: Duration,
-        block_builder_fee_info: Arc<Mutex<BlockBuilderFeeInfo>>,
         preallocated_bundle_cost: u64,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
         exit: Arc<AtomicBool>,
     ) {
-        // const LOOP_STATS_METRICS_PERIOD: Duration = Duration::from_secs(1);
-        //
-        // let ticks_per_slot = poh_recorder.read().unwrap().ticks_per_slot();
-        // let recorder = poh_recorder.read().unwrap().recorder();
-        // let qos_service = QosService::new(id);
-        //
-        // // Bundles can't mention any accounts related to consensus
-        // let mut consensus_cache_updater = ConsensusCacheUpdater::default();
-        // let mut last_tip_update_slot = Slot::default();
-        //
-        // let mut last_leader_slots_update_time = Instant::now();
-        // let mut bundle_stage_leader_stats = BundleStageLeaderSlotTrackingMetrics::default();
-        // let mut bundle_stage_stats = BundleStageLoopStats::default();
-        //
-        // // Bundles can't mention the tip payment program to ensure that a malicious entity doesn't
-        // // steal tips mid-slot
-        // let blacklisted_accounts = HashSet::from_iter([tip_manager.tip_payment_program_id()]);
-        //
-        // let mut unprocessed_bundles: VecDeque<PacketBundle> = VecDeque::with_capacity(1000);
-        // let mut cost_model_failed_bundles: VecDeque<PacketBundle> = VecDeque::with_capacity(1000);
-        // // Initialize block limits and open up last 20% of ticks to non-bundle transactions
-        // let mut reserved_space = BundleReservedSpace {
-        //     current_bundle_block_limit: MAX_BLOCK_UNITS,
-        //     current_tx_block_limit: MAX_BLOCK_UNITS.saturating_sub(preallocated_bundle_cost),
-        //     initial_allocated_cost: preallocated_bundle_cost,
-        //     unreserved_ticks: ticks_per_slot.saturating_div(5), // 20% for non-bundles
-        // };
-        // debug!(
-        //     "initialize bundled reserved space: {preallocated_bundle_cost} cu for {} ticks",
-        //     ticks_per_slot.saturating_sub(reserved_space.unreserved_ticks)
-        // );
-        //
-        // while !exit.load(Ordering::Relaxed) {
-        //     if !unprocessed_bundles.is_empty()
-        //         || last_leader_slots_update_time.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD
-        //     {
-        //         let (_, process_buffered_bundles_elapsed) = measure!(
-        //             Self::process_buffered_bundles(
-        //                 &bundle_account_locker,
-        //                 &mut unprocessed_bundles,
-        //                 &mut cost_model_failed_bundles,
-        //                 &blacklisted_accounts,
-        //                 &mut consensus_cache_updater,
-        //                 &cluster_info,
-        //                 &recorder,
-        //                 poh_recorder,
-        //                 &transaction_status_sender,
-        //                 &gossip_vote_sender,
-        //                 &qos_service,
-        //                 &tip_manager,
-        //                 &max_bundle_retry_duration,
-        //                 &mut last_tip_update_slot,
-        //                 &mut bundle_stage_leader_stats,
-        //                 &mut bundle_stage_stats,
-        //                 id,
-        //                 &block_builder_fee_info,
-        //                 &mut reserved_space,
-        //             ),
-        //             "process_buffered_bundles_elapsed"
-        //         );
-        //
-        //         saturating_add_assign!(
-        //             bundle_stage_stats.process_buffered_bundles_elapsed_us,
-        //             process_buffered_bundles_elapsed.as_us()
-        //         );
-        //         last_leader_slots_update_time = Instant::now();
-        //     }
-        //
-        //     bundle_stage_stats.maybe_report(id, LOOP_STATS_METRICS_PERIOD);
-        //
-        //     // ensure bundle stage can run immediately if bundles to process, otherwise okay
-        //     // chilling for a few
-        //     let sleep_time = if !unprocessed_bundles.is_empty() {
-        //         Duration::from_millis(0)
-        //     } else {
-        //         Duration::from_millis(10)
-        //     };
-        //
-        //     let (res, receive_and_buffer_elapsed) = measure!(
-        //         Self::receive_and_buffer_bundles(
-        //             &bundle_receiver,
-        //             &mut unprocessed_bundles,
-        //             sleep_time,
-        //         ),
-        //         "receive_and_buffer_elapsed"
-        //     );
-        //     saturating_add_assign!(
-        //         bundle_stage_stats.receive_and_buffer_bundles_elapsed_us,
-        //         receive_and_buffer_elapsed.as_us()
-        //     );
-        //
-        //     match res {
-        //         Ok(num_bundles_received) => {
-        //             saturating_add_assign!(
-        //                 bundle_stage_stats.num_bundles_received,
-        //                 num_bundles_received as u64
-        //             );
-        //         }
-        //         Err(RecvTimeoutError::Timeout) => {}
-        //         Err(RecvTimeoutError::Disconnected) => {
-        //             break;
-        //         }
-        //     }
-        // }
+        let ticks_per_slot = poh_recorder.read().unwrap().ticks_per_slot();
+
+        // The first 80% of the block, based on poh ticks, has `preallocated_bundle_cost` less compute units.
+        // The last 20% has has full compute so blockspace is maximized if BundleStage is idle.
+        let mut reserved_space = BundleReservedSpace {
+            current_bundle_block_limit: MAX_BLOCK_UNITS,
+            current_tx_block_limit: MAX_BLOCK_UNITS.saturating_sub(preallocated_bundle_cost),
+            initial_allocated_cost: preallocated_bundle_cost,
+            unreserved_ticks: ticks_per_slot.saturating_div(5),
+        };
 
         let mut last_metrics_update = Instant::now();
 
@@ -489,18 +380,19 @@ impl BundleStage {
                         &mut unprocessed_bundle_storage,
                         &bundle_stage_stats,
                         &mut bundle_stage_leader_stats,
-                        // &mut tracer_packet_stats,
                     ),
                     "process_buffered_packets",
                 );
-                // slot_metrics_tracker
-                //     .increment_process_buffered_packets_us(process_buffered_packets_time.as_us());
+                bundle_stage_leader_stats
+                    .leader_slot_metrics_tracker()
+                    .increment_process_buffered_packets_us(process_buffered_packets_time.as_us());
                 last_metrics_update = Instant::now();
             }
 
             match bundle_receiver.receive_and_buffer_bundles(
                 &mut unprocessed_bundle_storage,
                 &mut bundle_stage_stats,
+                &mut bundle_stage_leader_stats,
             ) {
                 Ok(_) | Err(RecvTimeoutError::Timeout) => (),
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -517,26 +409,6 @@ impl BundleStage {
         unprocessed_bundle_storage: &mut UnprocessedTransactionStorage,
         bundle_stage_stats: &BundleStageLoopStats,
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
-        // tracer_packet_stats: &mut TracerPacketStats,
-        // bundle_account_locker: &BundleAccountLocker,
-        // unprocessed_bundles: &mut VecDeque<PacketBundle>,
-        // cost_model_failed_bundles: &mut VecDeque<PacketBundle>,
-        // blacklisted_accounts: &HashSet<Pubkey>,
-        // consensus_cache_updater: &mut ConsensusCacheUpdater,
-        // cluster_info: &Arc<ClusterInfo>,
-        // recorder: &TransactionRecorder,
-        // poh_recorder: &Arc<RwLock<PohRecorder>>,
-        // transaction_status_sender: &Option<TransactionStatusSender>,
-        // gossip_vote_sender: &ReplayVoteSender,
-        // qos_service: &QosService,
-        // tip_manager: &TipManager,
-        // max_bundle_retry_duration: &Duration,
-        // last_tip_update_slot: &mut u64,
-        // bundle_stage_leader_stats: &mut BundleStageLeaderSlotTrackingMetrics,
-        // bundle_stage_stats: &mut BundleStageLoopStats,
-        // id: u32,
-        // block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
-        // reserved_space: &mut BundleReservedSpace,
     ) {
         //         const DROP_BUNDLE_SLOT_OFFSET: u64 = 4;
         //
@@ -615,6 +487,8 @@ impl BundleStage {
             .increment_make_decision_us(make_decision_time.as_us());
 
         match decision {
+            // BufferedPacketsDecision::Consume means this leader is scheduled to be running at the moment.
+            // Execute, record, and commit as many bundles possible given time, compute, and other constraints.
             BufferedPacketsDecision::Consume(bank_start) => {
                 // TODO (LB): look at leader_slot_metrics_tracker logic to determine if report happened,
                 //  and report bundle stage specific metrics
@@ -622,7 +496,9 @@ impl BundleStage {
                 // slot metrics tracker to the next slot) so that we don't count the
                 // packet processing metrics from the next slot towards the metrics
                 // of the previous slot
-                slot_metrics_tracker.apply_action(metrics_action);
+                bundle_stage_leader_stats
+                    .leader_slot_metrics_tracker()
+                    .apply_action(metrics_action);
                 let (_, consume_buffered_packets_time) = measure!(
                     consumer.consume_buffered_bundles(
                         &bank_start,
@@ -630,52 +506,32 @@ impl BundleStage {
                         bundle_stage_stats,
                         bundle_stage_leader_stats,
                     ),
-                    "consume_buffered_packets",
+                    "consume_buffered_bundles",
                 );
                 bundle_stage_leader_stats
                     .leader_slot_metrics_tracker()
                     .increment_consume_buffered_packets_us(consume_buffered_packets_time.as_us());
             }
-            // bundles aren't forwarded
-            // the leader slot is too far away, drop bundles
+            // BufferedPacketsDecision::Forward means the leader is slot is far away.
+            // Bundles aren't forwarded because it breaks atomicity guarantees, so just drop them
             BufferedPacketsDecision::Forward => {
-                // let ((), forward_us) = measure_us!(forwarder.handle_forwarding(
-                //     unprocessed_transaction_storage,
-                //     false,
-                //     slot_metrics_tracker,
-                //     banking_stage_stats,
-                //     tracer_packet_stats,
-                // ));
-                // slot_metrics_tracker.increment_forward_us(forward_us);
+                // TODO (LB): add metrics here for how many bundles were cleared
+                unprocessed_bundle_storage.bundle_storage().unwrap().reset();
 
                 // TODO (LB): look at leader_slot_metrics_tracker logic to determine if report happened,
                 //  and report bundle stage specific metrics
-                // Take metrics action after forwarding packets to include forwarded
-                // metrics into current slot
                 bundle_stage_leader_stats
                     .leader_slot_metrics_tracker()
                     .apply_action(metrics_action);
             }
-            // bundles aren't forwarded
-            // the leader slot is approaching, hold bundles
-            BufferedPacketsDecision::ForwardAndHold => {
-                // let ((), forward_and_hold_us) = measure_us!(forwarder.handle_forwarding(
-                //     unprocessed_transaction_storage,
-                //     true,
-                //     slot_metrics_tracker,
-                //     banking_stage_stats,
-                //     tracer_packet_stats,
-                // ));
-                // slot_metrics_tracker.increment_forward_and_hold_us(forward_and_hold_us);
-
-                // TODO (LB): look at leader_slot_metrics_tracker logic to determine if report happened,
-                //  and report bundle stage specific metrics
-                // Take metrics action after forwarding packets
+            // BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold means the validator
+            // is approaching the leader slot, hold bundles. Also, bundles aren't forwarded because it breaks
+            // atomicity guarantees
+            BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold => {
                 bundle_stage_leader_stats
                     .leader_slot_metrics_tracker()
                     .apply_action(metrics_action);
             }
-            _ => (),
         }
     }
 

@@ -1,6 +1,8 @@
-use crate::leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker;
 use {
-    crate::leader_slot_banking_stage_timing_metrics::LeaderExecuteAndCommitTimings,
+    crate::{
+        leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
+        leader_slot_banking_stage_timing_metrics::LeaderExecuteAndCommitTimings,
+    },
     solana_poh::poh_recorder::BankStart,
     solana_runtime::transaction_error_metrics::TransactionErrorMetrics,
     solana_sdk::{clock::Slot, saturating_add_assign},

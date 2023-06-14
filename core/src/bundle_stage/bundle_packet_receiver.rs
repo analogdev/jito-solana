@@ -5,6 +5,7 @@ use {
         bundle_stage::bundle_packet_deserializer::{
             BundlePacketDeserializer, ReceiveBundleResults,
         },
+        bundle_stage_leader_stats::BundleStageLeaderStats,
         immutable_deserialized_packet::{DeserializedBundlePackets, ImmutableDeserializedPacket},
         leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
         packet_bundle::PacketBundle,
@@ -47,6 +48,7 @@ impl BundleReceiver {
         &mut self,
         unprocessed_bundle_storage: &mut UnprocessedTransactionStorage,
         bundle_stage_stats: &mut BundleStageLoopStats,
+        bundle_stage_leader_stats: &mut BundleStageLeaderStats,
     ) -> Result<(), RecvTimeoutError> {
         let (result, recv_time_us) = measure_us!({
             let recv_timeout = Self::get_receive_timeout(unprocessed_bundle_storage);
@@ -60,7 +62,7 @@ impl BundleReceiver {
                         unprocessed_bundle_storage,
                         bundle_stage_stats,
                         // tracer_packet_stats,
-                        // slot_metrics_tracker,
+                        bundle_stage_leader_stats,
                     );
                     recv_and_buffer_measure.stop();
                     bundle_stage_stats
@@ -69,7 +71,9 @@ impl BundleReceiver {
                 })
         });
 
-        // slot_metrics_tracker.increment_receive_and_buffer_packets_us(recv_time_us);
+        bundle_stage_leader_stats
+            .leader_slot_metrics_tracker()
+            .increment_receive_and_buffer_packets_us(recv_time_us);
 
         result
     }
@@ -99,10 +103,18 @@ impl BundleReceiver {
         }: ReceiveBundleResults,
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
         bundle_stage_stats: &mut BundleStageLoopStats,
-        // slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+        bundle_stage_leader_stats: &mut BundleStageLeaderStats,
     ) {
         let bundle_count = deserialized_bundles.len();
         let packet_count: usize = deserialized_bundles.iter().map(|b| b.packets.len()).sum();
+
+        bundle_stage_stats
+            .num_bundles_received
+            .fetch_add(bundle_count, Ordering::Relaxed);
+        bundle_stage_stats
+            .num_packets_received
+            .fetch_add(packet_count, Ordering::Relaxed);
+
         debug!(
             "@{:?} bundles: {} txs: {} id: {}",
             timestamp(),
@@ -112,87 +124,62 @@ impl BundleReceiver {
         );
 
         // Track all the packets incoming from sigverify, both valid and invalid
-        // slot_metrics_tracker.increment_total_new_valid_packets(passed_sigverify_count);
-        // slot_metrics_tracker.increment_newly_failed_sigverify_count(failed_sigverify_count);
+        // TODO (LB:) track packet and bundle stats in bundle_stage_leader_stats
+        // bundle_stage_leader_stats
+        //     .leader_slot_metrics_tracker()
+        //     .increment_total_new_valid_packets(passed_sigverify_count);
+        // bundle_stage_leader_stats
+        //     .leader_slot_metrics_tracker()
+        //     .increment_newly_failed_sigverify_count(failed_sigverify_count);
 
-        let mut dropped_packets_count = 0;
-        let mut dropped_bundles_count = 0;
-        let mut newly_buffered_bundles_count = 0;
-        let mut newly_buffered_packets_count = 0;
         Self::push_unprocessed(
             unprocessed_transaction_storage,
             deserialized_bundles,
-            &mut dropped_packets_count,
-            &mut dropped_bundles_count,
-            &mut newly_buffered_bundles_count,
-            &mut newly_buffered_packets_count,
-            // bundle_stage_stats,
-            // slot_metrics_tracker,
-            // tracer_packet_stats,
+            bundle_stage_leader_stats,
+            bundle_stage_stats,
         );
 
-        bundle_stage_stats
-            .num_bundles_received
-            .fetch_add(bundle_count, Ordering::Relaxed);
-        bundle_stage_stats
-            .num_packets_received
-            .fetch_add(packet_count, Ordering::Relaxed);
+        let bundle_storage = unprocessed_transaction_storage.bundle_storage().unwrap();
 
         bundle_stage_stats
-            .newly_buffered_bundles_count
-            .fetch_add(newly_buffered_bundles_count, Ordering::Relaxed);
-        bundle_stage_stats
-            .newly_buffered_packets_count
-            .fetch_add(newly_buffered_packets_count, Ordering::Relaxed);
-
+            .current_buffered_packets_count
+            .swap(bundle_storage.unprocessed_packets_len(), Ordering::Relaxed);
         bundle_stage_stats
             .current_buffered_bundles_count
-            .swap(unprocessed_transaction_storage.len(), Ordering::Relaxed);
-
-        // TODO (LB): add current_buffered_bundles_count and current_buffered_packets_count
-        // bundle_stage_stats
-        //     .current_buffered_packets_count
-        //     .swap(unprocessed_transaction_storage.iter(), Ordering::Relaxed);
-
-        bundle_stage_stats
-            .num_bundles_dropped
-            .fetch_add(dropped_bundles_count, Ordering::Relaxed);
-        bundle_stage_stats
-            .num_packets_dropped
-            .fetch_add(dropped_packets_count, Ordering::Relaxed);
+            .swap(bundle_storage.unprocessed_bundles_len(), Ordering::Relaxed);
     }
 
     fn push_unprocessed(
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
         deserialized_bundles: Vec<DeserializedBundlePackets>,
-        dropped_packets_count: &mut usize,
-        dropped_bundles_count: &mut usize,
-        newly_buffered_bundles_count: &mut usize,
-        newly_buffered_packets_count: &mut usize,
-        // bundle_stage_stats: &mut BundleStageLoopStats,
-        // slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
-        // tracer_packet_stats: &mut TracerPacketStats,
+        bundle_stage_leader_stats: &mut BundleStageLeaderStats,
+        bundle_stage_stats: &mut BundleStageLoopStats,
     ) {
         if !deserialized_bundles.is_empty() {
-            // let _ = banking_stage_stats
-            //     .batch_packet_indexes_len
-            //     .increment(deserialized_packets.len() as u64);
-
-            *newly_buffered_bundles_count += deserialized_bundles.len();
-            // slot_metrics_tracker
-            //     .increment_newly_buffered_packets_count(deserialized_packets.len() as u64);
-
             let insert_bundles_summary =
                 unprocessed_transaction_storage.insert_bundles(deserialized_bundles);
-            // slot_metrics_tracker
-            //     .accumulate_insert_packet_batches_summary(&insert_packet_batches_summary);
-            // saturating_add_assign!(
-            //     *dropped_packets_count,
-            //     insert_packet_batches_summary.total_dropped_packets()
-            // );
-            // tracer_packet_stats.increment_total_exceeded_banking_stage_buffer(
-            //     insert_packet_batches_summary.dropped_tracer_packets(),
-            // );
+
+            bundle_stage_stats.newly_buffered_bundles_count.fetch_add(
+                insert_bundles_summary.num_bundles_inserted,
+                Ordering::Relaxed,
+            );
+
+            bundle_stage_stats.num_bundles_dropped.fetch_add(
+                insert_bundles_summary.num_bundles_dropped,
+                Ordering::Relaxed,
+            );
+
+            bundle_stage_leader_stats
+                .leader_slot_metrics_tracker()
+                .increment_newly_buffered_packets_count(
+                    insert_bundles_summary.num_packets_inserted as u64,
+                );
+
+            bundle_stage_leader_stats
+                .leader_slot_metrics_tracker()
+                .accumulate_insert_packet_batches_summary(
+                    &insert_bundles_summary.insert_packets_summary,
+                );
         }
     }
 }
