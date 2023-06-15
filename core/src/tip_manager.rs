@@ -251,10 +251,6 @@ impl TipManager {
         .unwrap()
     }
 
-    pub fn lock(&self) -> MutexGuard<()> {
-        self.lock.lock().unwrap()
-    }
-
     /// Returns this validator's [TipDistributionAccount] PDA derived from the provided epoch.
     pub fn get_my_tip_distribution_pda(&self, epoch: Epoch) -> Pubkey {
         derive_tip_distribution_account_address(

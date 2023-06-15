@@ -1,6 +1,10 @@
 use {
     crate::{
         banking_stage::{BankingStageStats, FilterForwardingResults, ForwardOption},
+        bundle_account_locker::LockedBundle,
+        // bundle_sanitizer::{get_sanitized_bundle, BundleSanitizerError},
+        bundle_stage::BundleStageLoopStats,
+        bundle_stage_leader_stats::{BundleStageLeaderStats, BundleStageStats},
         forward_packet_batches_by_accounts::ForwardPacketBatchesByAccounts,
         immutable_deserialized_packet::{DeserializedBundlePackets, ImmutableDeserializedPacket},
         latest_unprocessed_votes::{
@@ -18,14 +22,15 @@ use {
     itertools::Itertools,
     min_max_heap::MinMaxHeap,
     solana_measure::measure,
-    solana_runtime::bank::Bank,
+    solana_runtime::{bank::Bank, transaction_error_metrics::TransactionErrorMetrics},
     solana_sdk::{
-        clock::FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET, feature_set::FeatureSet, hash::Hash,
-        saturating_add_assign, transaction::SanitizedTransaction,
+        bundle::sanitized::SanitizedBundle, clock::FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET,
+        feature_set::FeatureSet, hash::Hash, pubkey::Pubkey, saturating_add_assign,
+        transaction::SanitizedTransaction,
     },
     std::{
         cmp::min,
-        collections::{HashMap, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         sync::{atomic::Ordering, Arc},
     },
 };
@@ -408,13 +413,34 @@ impl UnprocessedTransactionStorage {
                 slot_metrics_tracker,
                 processing_function,
             ),
+            UnprocessedTransactionStorage::BundleStorage(_) => panic!(
+                "UnprocessedTransactionStorage::BundleStorage does not support processing packets"
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn process_bundles<F>(
+        &mut self,
+        bank: Arc<Bank>,
+        bundle_stage_loop_stats: &BundleStageLoopStats,
+        bundle_stage_leader_stats: &mut BundleStageLeaderStats,
+        blacklisted_accounts: &HashSet<Pubkey>,
+        processing_function: F,
+    ) -> bool
+    where
+        F: FnMut(&DeserializedBundlePackets, &LockedBundle) -> Option<Vec<usize>>,
+    {
+        match self {
             UnprocessedTransactionStorage::BundleStorage(bundle_storage) => bundle_storage
-                .process_packets(
+                .process_bundles(
                     bank,
-                    banking_stage_stats,
-                    slot_metrics_tracker,
+                    bundle_stage_loop_stats,
+                    bundle_stage_leader_stats,
+                    blacklisted_accounts,
                     processing_function,
                 ),
+            _ => panic!("class does not support processing bundles"),
         }
     }
 
@@ -1036,7 +1062,7 @@ impl BundleStorage {
     pub fn unprocessed_packets_len(&self) -> usize {
         self.unprocessed_bundle_storage
             .iter()
-            .map(|b| b.packets.len())
+            .map(|b| b.len())
             .sum()
     }
 
@@ -1047,7 +1073,7 @@ impl BundleStorage {
     fn cost_model_buffered_packets_len(&self) -> usize {
         self.cost_model_buffered_bundle_storage
             .iter()
-            .map(|b| b.packets.len())
+            .map(|b| b.len())
             .sum()
     }
 
@@ -1077,10 +1103,10 @@ impl BundleStorage {
         for bundle in deserialized_bundles {
             if self.unprocessed_bundle_storage.capacity() == self.unprocessed_bundle_storage.len() {
                 saturating_add_assign!(num_bundles_dropped, 1);
-                saturating_add_assign!(num_packets_dropped, bundle.packets.len());
+                saturating_add_assign!(num_packets_dropped, bundle.len());
             } else {
                 saturating_add_assign!(num_bundles_inserted, 1);
-                saturating_add_assign!(num_packets_inserted, bundle.packets.len());
+                saturating_add_assign!(num_packets_inserted, bundle.len());
                 self.unprocessed_bundle_storage.push_back(bundle);
             }
         }
@@ -1097,13 +1123,58 @@ impl BundleStorage {
         }
     }
 
-    fn process_packets<F>(
+    pub fn process_bundles<F>(
         &mut self,
         bank: Arc<Bank>,
-        banking_stage_stats: &BankingStageStats,
-        slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+        bundle_stage_loop_stats: &BundleStageLoopStats,
+        bundle_stage_leader_stats: &mut BundleStageLeaderStats,
+        blacklisted_accounts: &HashSet<Pubkey>,
         mut processing_function: F,
-    ) -> bool {
+    ) -> bool
+    where
+        F: FnMut(&DeserializedBundlePackets, &LockedBundle) -> Option<Vec<usize>>,
+    {
+        let mut transaction_errors = TransactionErrorMetrics::default();
+
+        let (sanitized_bundles, sanitized_bundle_elapsed) = measure!(
+            self.unprocessed_bundle_storage
+                .drain(..)
+                .into_iter()
+                .filter_map(|packet_bundle| {
+                    let mut error_metrics = TransactionErrorMetrics::default();
+                    let r = packet_bundle.build_sanitized_bundle(
+                        &bank,
+                        blacklisted_accounts,
+                        &mut error_metrics,
+                    );
+
+                    bundle_stage_leader_stats
+                        .leader_slot_metrics_tracker()
+                        .accumulate_transaction_errors(&error_metrics);
+
+                    match r {
+                        Ok(sanitized_bundle) => {
+                            bundle_stage_leader_stats
+                                .bundle_stage_stats()
+                                .increment_sanitize_transaction_ok();
+                            Some((packet_bundle, sanitized_bundle))
+                        }
+                        Err(e) => {
+                            bundle_stage_leader_stats
+                                .bundle_stage_stats()
+                                .increment_sanitize_error(e);
+                            None
+                        }
+                    }
+                })
+                .collect::<VecDeque<(_, _)>>(),
+            "sanitized_bundle_elapsed"
+        );
+
+        bundle_stage_leader_stats
+            .leader_slot_metrics_tracker()
+            .accumulate_transaction_errors(&transaction_errors);
+
         true
     }
 }

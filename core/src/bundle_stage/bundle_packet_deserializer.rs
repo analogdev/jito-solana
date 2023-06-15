@@ -1,4 +1,5 @@
 //! Deserializes PacketBundles
+use crate::immutable_deserialized_packet::DeserializedBundleError;
 use {
     crate::{
         banking_trace::{BankingPacketBatch, BankingPacketReceiver},
@@ -50,7 +51,8 @@ impl BundlePacketDeserializer {
         recv_timeout: Duration,
         capacity: usize,
     ) -> Result<ReceiveBundleResults, RecvTimeoutError> {
-        let (bundle_count, _packet_count, bundles) = self.receive_until(recv_timeout, capacity)?;
+        let (bundle_count, _packet_count, mut bundles) =
+            self.receive_until(recv_timeout, capacity)?;
 
         // Note: this can be removed after feature `round_compute_unit_price` is activated in
         // mainnet-beta
@@ -59,7 +61,7 @@ impl BundlePacketDeserializer {
 
         Ok(Self::deserialize_and_collect_bundles(
             bundle_count,
-            &bundles,
+            &mut bundles,
             round_compute_unit_price_enabled,
         ))
     }
@@ -68,21 +70,22 @@ impl BundlePacketDeserializer {
     /// them into ReceivePacketResults
     fn deserialize_and_collect_bundles(
         bundle_count: usize,
-        bundles: &[PacketBundle],
+        bundles: &mut [PacketBundle],
         round_compute_unit_price_enabled: bool,
     ) -> ReceiveBundleResults {
         let mut deserialized_bundles = Vec::with_capacity(bundle_count);
         let mut num_dropped_bundles: usize = 0;
         let mut num_dropped_packets: usize = 0;
 
-        for bundle in bundles {
-            if let Some(deserialized_bundle) =
-                Self::deserialize_bundle(bundle, round_compute_unit_price_enabled)
-            {
-                deserialized_bundles.push(deserialized_bundle);
-            } else {
-                saturating_add_assign!(num_dropped_bundles, 1);
-                saturating_add_assign!(num_dropped_packets, bundle.batch.len());
+        for bundle in bundles.iter_mut() {
+            match Self::deserialize_bundle(bundle, round_compute_unit_price_enabled) {
+                Ok(deserialized_bundle) => {
+                    deserialized_bundles.push(deserialized_bundle);
+                }
+                Err(e) => {
+                    saturating_add_assign!(num_dropped_bundles, 1);
+                    saturating_add_assign!(num_dropped_packets, bundle.batch.len());
+                }
             }
         }
 
@@ -126,33 +129,15 @@ impl BundlePacketDeserializer {
     /// Deserializes the Bundle into DeserializedBundlePackets, returning None if any packet in the
     /// bundle failed to deserialize
     pub fn deserialize_bundle(
-        bundle: &PacketBundle,
+        bundle: &mut PacketBundle,
         round_compute_unit_price_enabled: bool,
-    ) -> Option<DeserializedBundlePackets> {
-        let packets: Vec<_> = bundle
-            .batch
-            .iter()
-            .filter_map(|p| {
-                let mut packet_clone = p.clone();
-                packet_clone
-                    .meta_mut()
-                    .set_round_compute_unit_price(round_compute_unit_price_enabled);
-                ImmutableDeserializedPacket::new(packet_clone).ok()
-            })
-            .collect();
+    ) -> Result<DeserializedBundlePackets, DeserializedBundleError> {
+        bundle.batch.iter_mut().for_each(|p| {
+            p.meta_mut()
+                .set_round_compute_unit_price(round_compute_unit_price_enabled);
+        });
 
-        // All packets in a bundle must deserialize
-        if packets.len() != bundle.batch.len() {
-            return None;
-        }
-
-        // TODO (LB): should we run other basic packet-level checks here?
-        //  might be better early in block engine stage to avoid a DOS attack with extremely large bundles
-
-        Some(DeserializedBundlePackets {
-            uuid: bundle.bundle_id.to_string(),
-            packets,
-        })
+        DeserializedBundlePackets::new(bundle, Some(5))
     }
 }
 

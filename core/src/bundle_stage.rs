@@ -10,7 +10,7 @@ use {
         },
         bundle_account_locker::{BundleAccountLocker, BundleAccountLockerResult, LockedBundle},
         bundle_consumer::BundleConsumer,
-        bundle_sanitizer::{get_sanitized_bundle, BundleSanitizerError},
+        // bundle_sanitizer::{get_sanitized_bundle, BundleSanitizerError},
         bundle_stage::bundle_packet_receiver::BundleReceiver,
         bundle_stage_leader_stats::BundleStageLeaderStats,
         consensus_cache_updater::ConsensusCacheUpdater,
@@ -173,13 +173,6 @@ impl BundleStageLoopStats {
     }
 }
 
-// struct AllExecutionResults {
-//     pub load_and_execute_tx_output: LoadAndExecuteTransactionsOutput,
-//     pub sanitized_txs: Vec<SanitizedTransaction>,
-//     pub pre_balances: (TransactionBalances, TransactionTokenBalances),
-//     pub post_balances: (TransactionBalances, TransactionTokenBalances),
-// }
-
 struct BundleReservedSpace {
     current_tx_block_limit: u64,
     current_bundle_block_limit: u64,
@@ -314,6 +307,7 @@ impl BundleStage {
             bundle_account_locker,
             block_builder_fee_info.clone(),
             max_bundle_retry_duration,
+            cluster_info,
         );
 
         let unprocessed_bundle_storage = UnprocessedTransactionStorage::new_bundle_storage(
@@ -330,7 +324,6 @@ impl BundleStage {
                     consumer,
                     BUNDLE_STAGE_ID,
                     unprocessed_bundle_storage,
-                    cluster_info,
                     preallocated_bundle_cost,
                     poh_recorder,
                     exit,
@@ -345,10 +338,9 @@ impl BundleStage {
     fn process_loop(
         bundle_receiver: &mut BundleReceiver,
         decision_maker: DecisionMaker,
-        consumer: BundleConsumer,
+        mut consumer: BundleConsumer,
         id: u32,
         mut unprocessed_bundle_storage: UnprocessedTransactionStorage,
-        cluster_info: Arc<ClusterInfo>,
         preallocated_bundle_cost: u64,
         poh_recorder: Arc<RwLock<PohRecorder>>,
         exit: Arc<AtomicBool>,
@@ -376,7 +368,7 @@ impl BundleStage {
                 let (_, process_buffered_packets_time) = measure!(
                     Self::process_buffered_bundles(
                         &decision_maker,
-                        &consumer,
+                        &mut consumer,
                         &mut unprocessed_bundle_storage,
                         &bundle_stage_stats,
                         &mut bundle_stage_leader_stats,
@@ -405,77 +397,11 @@ impl BundleStage {
     #[allow(clippy::too_many_arguments)]
     fn process_buffered_bundles(
         decision_maker: &DecisionMaker,
-        consumer: &BundleConsumer,
+        consumer: &mut BundleConsumer,
         unprocessed_bundle_storage: &mut UnprocessedTransactionStorage,
         bundle_stage_stats: &BundleStageLoopStats,
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
     ) {
-        //         const DROP_BUNDLE_SLOT_OFFSET: u64 = 4;
-        //
-        //         let r_poh_recorder = poh_recorder.read().unwrap();
-        //         let poh_recorder_bank = r_poh_recorder.get_poh_recorder_bank();
-        //         let working_bank_start = poh_recorder_bank.working_bank_start();
-        //         let would_be_leader_soon =
-        //             r_poh_recorder.would_be_leader(DROP_BUNDLE_SLOT_OFFSET * DEFAULT_TICKS_PER_SLOT);
-        //         drop(r_poh_recorder);
-        //
-        //         let last_slot = bundle_stage_leader_stats.current_slot;
-        //         bundle_stage_leader_stats.maybe_report(id, &working_bank_start);
-        //
-        //         if !would_be_leader_soon {
-        //             saturating_add_assign!(
-        //                 bundle_stage_stats.num_bundles_dropped,
-        //                 unprocessed_bundles.len() as u64 + cost_model_failed_bundles.len() as u64
-        //             );
-        //             unprocessed_bundles.clear();
-        //             cost_model_failed_bundles.clear();
-        //             return;
-        //         }
-        //
-        //         // leader now, insert new read bundles + as many as can read then return bank
-        //         if let Some(bank_start) = working_bank_start {
-        //             consensus_cache_updater.maybe_update(&bank_start.working_bank);
-        //
-        //             let is_new_slot = match (last_slot, bundle_stage_leader_stats.current_slot) {
-        //                 (Some(last_slot), Some(current_slot)) => last_slot != current_slot,
-        //                 (None, Some(_)) => true,
-        //                 (_, _) => false,
-        //             };
-        //             if is_new_slot {
-        //                 reserved_space.reset_reserved_cost(&bank_start.working_bank);
-        //                 // Re-Buffer any bundles that didn't fit into last block
-        //                 if !cost_model_failed_bundles.is_empty() {
-        //                     info!(
-        //                         "slot {}: re-buffering {} bundles that failed cost model.",
-        //                         &bank_start.working_bank.slot(),
-        //                         cost_model_failed_bundles.len()
-        //                     );
-        //                     unprocessed_bundles.extend(cost_model_failed_bundles.drain(..));
-        //                 }
-        //             } else {
-        //                 reserved_space.update_reserved_cost(&bank_start.working_bank);
-        //             }
-        //
-        //             Self::execute_bundles_until_empty_or_end_of_slot(
-        //                 bundle_account_locker,
-        //                 unprocessed_bundles,
-        //                 cost_model_failed_bundles,
-        //                 blacklisted_accounts,
-        //                 bank_start,
-        //                 consensus_cache_updater.consensus_accounts_cache(),
-        //                 cluster_info,
-        //                 recorder,
-        //                 transaction_status_sender,
-        //                 gossip_vote_sender,
-        //                 qos_service,
-        //                 tip_manager,
-        //                 max_bundle_retry_duration,
-        //                 last_tip_update_slot,
-        //                 bundle_stage_leader_stats.bundle_stage_leader_stats(),
-        //                 block_builder_fee_info,
-        //                 reserved_space,
-        //             );
-        //         }
         let (decision, make_decision_time) =
             measure!(decision_maker.make_consume_or_forward_decision());
 

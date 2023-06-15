@@ -1,3 +1,14 @@
+use std::collections::hash_map::RandomState;
+// use crate::bundle_sanitizer::BundleSanitizerError;
+use crate::packet_bundle::PacketBundle;
+use solana_perf::sigverify::verify_packet;
+use solana_runtime::bank::Bank;
+use solana_runtime::transaction_error_metrics::TransactionErrorMetrics;
+use solana_sdk::bundle::sanitized::SanitizedBundle;
+use solana_sdk::clock::MAX_PROCESSING_AGE;
+use solana_sdk::pubkey::Pubkey;
+use std::collections::HashSet;
+use std::iter::repeat;
 use {
     solana_perf::packet::Packet,
     solana_runtime::transaction_priority_details::{
@@ -34,12 +45,6 @@ pub enum DeserializedPacketError {
     PrioritizationFailure,
     #[error("vote transaction failure")]
     VoteTransactionError,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct DeserializedBundlePackets {
-    pub uuid: String,
-    pub packets: Vec<ImmutableDeserializedPacket>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -148,6 +153,146 @@ fn packet_message(packet: &Packet) -> Result<&[u8], DeserializedPacketError> {
         .and_then(|v| v.checked_add(sig_size))
         .and_then(|msg_start| packet.data(msg_start..))
         .ok_or(DeserializedPacketError::SignatureOverflowed(sig_size))
+}
+
+#[derive(Debug, Error)]
+pub enum DeserializedBundleError {
+    #[error("FailedToSerializePacket")]
+    FailedToSerializePacket,
+
+    #[error("EmptyBatch")]
+    EmptyBatch,
+
+    #[error("TooManyPackets")]
+    TooManyPackets,
+
+    #[error("MarkedDiscard")]
+    MarkedDiscard,
+
+    #[error("SignatureVerificationFailure")]
+    SignatureVerificationFailure,
+
+    #[error("Bank is in vote-only mode")]
+    VoteOnlyMode,
+
+    #[error("Bundle packet batch failed pre-check")]
+    FailedPacketBatchPreCheck,
+
+    #[error("Bundle mentions blacklisted account")]
+    BlacklistedAccount,
+
+    #[error("Bundle contains a transaction that failed to serialize")]
+    FailedToSerializeTransaction,
+
+    #[error("Bundle contains a duplicate transaction")]
+    DuplicateTransaction,
+
+    #[error("Bundle failed check_transactions")]
+    FailedCheckTransactions,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeserializedBundlePackets {
+    uuid: String,
+    packets: Vec<ImmutableDeserializedPacket>,
+}
+
+impl DeserializedBundlePackets {
+    pub fn new(
+        bundle: &mut PacketBundle,
+        max_len: Option<usize>,
+    ) -> Result<Self, DeserializedBundleError> {
+        // Checks: non-zero, less than some length, marked for discard, signature verification failed, failed to sanitize to
+        // ImmutableDeserializedPacket
+        if bundle.batch.is_empty() {
+            return Err(DeserializedBundleError::EmptyBatch);
+        }
+        if max_len
+            .map(|max_len| bundle.batch.len() > max_len)
+            .unwrap_or(false)
+        {
+            return Err(DeserializedBundleError::TooManyPackets);
+        }
+        if bundle.batch.iter().any(|p| p.meta().discard()) {
+            return Err(DeserializedBundleError::MarkedDiscard);
+        }
+        if bundle.batch.iter_mut().any(|p| !verify_packet(p, false)) {
+            return Err(DeserializedBundleError::SignatureVerificationFailure);
+        }
+
+        let immutable_packets: Vec<_> = bundle
+            .batch
+            .iter()
+            .filter_map(|p| ImmutableDeserializedPacket::new(p.clone()).ok())
+            .collect();
+
+        if bundle.batch.len() != immutable_packets.len() {
+            return Err(DeserializedBundleError::FailedToSerializePacket);
+        }
+
+        Ok(Self {
+            uuid: bundle.bundle_id.clone(),
+            packets: immutable_packets,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    pub fn build_sanitized_bundle(
+        &self,
+        bank: &Bank,
+        blacklisted_accounts: &HashSet<Pubkey>,
+        transaction_error_metrics: &mut TransactionErrorMetrics,
+    ) -> Result<SanitizedBundle, DeserializedBundleError> {
+        let transactions: Vec<SanitizedTransaction> = self
+            .packets
+            .iter()
+            .filter_map(|p| {
+                p.build_sanitized_transaction(&bank.feature_set, bank.vote_only_bank(), bank)
+            })
+            .collect();
+
+        if self.packets.len() != transactions.len() {
+            return Err(DeserializedBundleError::FailedToSerializeTransaction);
+        }
+
+        let unique_signatures: HashSet<&Signature, RandomState> =
+            HashSet::from_iter(transactions.iter().map(|tx| tx.signature()));
+        if unique_signatures.len() != transactions.len() {
+            return Err(DeserializedBundleError::DuplicateTransaction);
+        }
+
+        let contains_blacklisted_account = transactions.iter().any(|tx| {
+            tx.message()
+                .account_keys()
+                .iter()
+                .any(|acc| blacklisted_accounts.contains(acc))
+        });
+
+        if contains_blacklisted_account {
+            return Err(DeserializedBundleError::BlacklistedAccount);
+        }
+
+        // assume everything locks okay to check for already-processed transaction or expired/invalid blockhash
+        let lock_results: Vec<_> = repeat(Ok(())).take(transactions.len()).collect();
+        let check_results = bank.check_transactions(
+            &transactions,
+            &lock_results,
+            MAX_PROCESSING_AGE,
+            transaction_error_metrics,
+        );
+
+        if check_results.iter().any(|r| r.0.is_err()) {
+            return Err(DeserializedBundleError::FailedCheckTransactions);
+        }
+
+        Ok(SanitizedBundle {
+            transactions,
+            bundle_id: self.uuid.clone(),
+        })
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use crate::immutable_deserialized_packet::DeserializedBundlePackets;
 ///! Turns packets into SanitizedTransactions and ensure they pass sanity checks
 use {
     crate::immutable_deserialized_packet::ImmutableDeserializedPacket,
@@ -23,23 +24,23 @@ use {
 
 pub const MAX_PACKETS_PER_BUNDLE: usize = 5;
 
-#[derive(Error, Debug, PartialEq, Eq, Clone)]
-pub enum BundleSanitizerError {
-    #[error("Bank is in vote-only mode")]
-    VoteOnlyMode,
-    #[error("Bundle packet batch failed pre-check")]
-    FailedPacketBatchPreCheck,
-    #[error("Bundle mentions blacklisted account")]
-    BlacklistedAccount,
-    #[error("Bundle contains a transaction that failed to serialize")]
-    FailedToSerializeTransaction,
-    #[error("Bundle contains a duplicate transaction")]
-    DuplicateTransaction,
-    #[error("Bundle failed check_transactions")]
-    FailedCheckTransactions,
-}
-
-pub type BundleSanitizationResult<T> = Result<T, BundleSanitizerError>;
+// #[derive(Error, Debug, PartialEq, Eq, Clone)]
+// pub enum BundleSanitizerError {
+//     #[error("Bank is in vote-only mode")]
+//     VoteOnlyMode,
+//     #[error("Bundle packet batch failed pre-check")]
+//     FailedPacketBatchPreCheck,
+//     #[error("Bundle mentions blacklisted account")]
+//     BlacklistedAccount,
+//     #[error("Bundle contains a transaction that failed to serialize")]
+//     FailedToSerializeTransaction,
+//     #[error("Bundle contains a duplicate transaction")]
+//     DuplicateTransaction,
+//     #[error("Bundle failed check_transactions")]
+//     FailedCheckTransactions,
+// }
+//
+// pub type BundleSanitizationResult<T> = Result<T, BundleSanitizerError>;
 
 /// An invalid bundle contains one of the following:
 ///  No packets.
@@ -52,76 +53,75 @@ pub type BundleSanitizationResult<T> = Result<T, BundleSanitizerError>;
 ///  Contains a transaction that was already processed or one with an invalid blockhash.
 /// NOTE: bundles need to be sanitized for a given bank. For instance, a bundle sanitized
 /// on bank n-1 will be valid for all of bank n-1, and may or may not be valid for bank n
-pub fn get_sanitized_bundle(
-    packet_bundle: &mut PacketBundle,
-    bank: &Arc<Bank>,
-    consensus_accounts_cache: &HashSet<Pubkey>,
-    blacklisted_accounts: &HashSet<Pubkey>,
-    transaction_error_metrics: &mut TransactionErrorMetrics,
-) -> BundleSanitizationResult<SanitizedBundle> {
-    if bank.vote_only_bank() {
-        return Err(BundleSanitizerError::VoteOnlyMode);
-    }
-
-    if packet_bundle.batch.is_empty()
-        || packet_bundle.batch.len() > MAX_PACKETS_PER_BUNDLE
-        || packet_bundle.batch.iter().any(|p| p.meta().discard())
-        || packet_bundle
-            .batch
-            .iter_mut()
-            .any(|p| !verify_packet(p, false))
-    {
-        return Err(BundleSanitizerError::FailedPacketBatchPreCheck);
-    }
-
-    let packet_indexes = (0..packet_bundle.batch.len()).collect::<Vec<usize>>();
-    let deserialized_packets =
-        PacketDeserializer::deserialize_packets(&packet_bundle.batch, &packet_indexes, false);
-
-    let transactions: Vec<SanitizedTransaction> = deserialized_packets
-        .filter_map(|p| {
-            p.build_sanitized_transaction(&bank.feature_set, bank.vote_only_bank(), bank.as_ref())
-        })
-        .collect();
-
-    let unique_signatures: HashSet<&Signature, RandomState> =
-        HashSet::from_iter(transactions.iter().map(|tx| tx.signature()));
-    let contains_blacklisted_account = transactions.iter().any(|tx| {
-        let accounts = tx.message().account_keys();
-        accounts
-            .iter()
-            .any(|acc| blacklisted_accounts.contains(acc) || consensus_accounts_cache.contains(acc))
-    });
-
-    if contains_blacklisted_account {
-        return Err(BundleSanitizerError::BlacklistedAccount);
-    }
-
-    if transactions.is_empty() || packet_bundle.batch.len() != transactions.len() {
-        return Err(BundleSanitizerError::FailedToSerializeTransaction);
-    }
-
-    if unique_signatures.len() != transactions.len() {
-        return Err(BundleSanitizerError::DuplicateTransaction);
-    }
-
-    // assume everything locks okay to check for already-processed transaction or expired/invalid blockhash
-    let lock_results: Vec<_> = repeat(Ok(())).take(transactions.len()).collect();
-    let check_results = bank.check_transactions(
-        &transactions,
-        &lock_results,
-        MAX_PROCESSING_AGE,
-        transaction_error_metrics,
-    );
-    if check_results.iter().any(|r| r.0.is_err()) {
-        return Err(BundleSanitizerError::FailedCheckTransactions);
-    }
-
-    Ok(SanitizedBundle {
-        transactions,
-        bundle_id: packet_bundle.bundle_id.clone(),
-    })
-}
+// pub fn get_sanitized_bundle(
+//     packet_bundle: &mut DeserializedBundlePackets,
+//     bank: &Arc<Bank>,
+//     blacklisted_accounts: &HashSet<Pubkey>,
+//     transaction_error_metrics: &mut TransactionErrorMetrics,
+// ) -> BundleSanitizationResult<SanitizedBundle> {
+//     if bank.vote_only_bank() {
+//         return Err(BundleSanitizerError::VoteOnlyMode);
+//     }
+//
+//     if packet_bundle.batch.is_empty()
+//         || packet_bundle.batch.len() > MAX_PACKETS_PER_BUNDLE
+//         || packet_bundle.batch.iter().any(|p| p.meta().discard())
+//         || packet_bundle
+//             .batch
+//             .iter_mut()
+//             .any(|p| !verify_packet(p, false))
+//     {
+//         return Err(BundleSanitizerError::FailedPacketBatchPreCheck);
+//     }
+//
+//     let packet_indexes = (0..packet_bundle.batch.len()).collect::<Vec<usize>>();
+//     let deserialized_packets =
+//         PacketDeserializer::deserialize_packets(&packet_bundle.batch, &packet_indexes, false);
+//
+//     let transactions: Vec<SanitizedTransaction> = deserialized_packets
+//         .filter_map(|p| {
+//             p.build_sanitized_transaction(&bank.feature_set, bank.vote_only_bank(), bank.as_ref())
+//         })
+//         .collect();
+//
+//     let unique_signatures: HashSet<&Signature, RandomState> =
+//         HashSet::from_iter(transactions.iter().map(|tx| tx.signature()));
+//     let contains_blacklisted_account = transactions.iter().any(|tx| {
+//         tx.message()
+//             .account_keys()
+//             .iter()
+//             .any(|acc| blacklisted_accounts.contains(acc))
+//     });
+//
+//     if contains_blacklisted_account {
+//         return Err(BundleSanitizerError::BlacklistedAccount);
+//     }
+//
+//     if transactions.is_empty() || packet_bundle.batch.len() != transactions.len() {
+//         return Err(BundleSanitizerError::FailedToSerializeTransaction);
+//     }
+//
+//     if unique_signatures.len() != transactions.len() {
+//         return Err(BundleSanitizerError::DuplicateTransaction);
+//     }
+//
+//     // assume everything locks okay to check for already-processed transaction or expired/invalid blockhash
+//     let lock_results: Vec<_> = repeat(Ok(())).take(transactions.len()).collect();
+//     let check_results = bank.check_transactions(
+//         &transactions,
+//         &lock_results,
+//         MAX_PROCESSING_AGE,
+//         transaction_error_metrics,
+//     );
+//     if check_results.iter().any(|r| r.0.is_err()) {
+//         return Err(BundleSanitizerError::FailedCheckTransactions);
+//     }
+//
+//     Ok(SanitizedBundle {
+//         transactions,
+//         bundle_id: packet_bundle.bundle_id.clone(),
+//     })
+// }
 
 #[cfg(test)]
 mod tests {

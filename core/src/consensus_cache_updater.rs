@@ -41,12 +41,13 @@ impl ConsensusCacheUpdater {
     }
 
     /// Updates consensus-related accounts on epoch boundaries
-    /// Bundles must not contain any consensus related accounts in order to prevent starvation
-    /// of voting related transactions
-    pub(crate) fn maybe_update(&mut self, bank: &Bank) {
+    pub(crate) fn maybe_update(&mut self, bank: &Bank) -> bool {
         if bank.epoch() > self.last_epoch_updated {
             self.consensus_accounts_cache = Self::get_consensus_accounts(bank);
             self.last_epoch_updated = bank.epoch();
+            true
+        } else {
+            false
         }
     }
 }

@@ -106,7 +106,7 @@ impl BundleReceiver {
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
     ) {
         let bundle_count = deserialized_bundles.len();
-        let packet_count: usize = deserialized_bundles.iter().map(|b| b.packets.len()).sum();
+        let packet_count: usize = deserialized_bundles.iter().map(|b| b.len()).sum();
 
         bundle_stage_stats
             .num_bundles_received

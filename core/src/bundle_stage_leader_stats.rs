@@ -1,3 +1,5 @@
+// use crate::bundle_sanitizer::BundleSanitizerError;
+use crate::immutable_deserialized_packet::DeserializedBundleError;
 use {
     crate::{
         leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
@@ -184,36 +186,31 @@ impl BundleStageStats {
         );
     }
 
-    pub fn increment_sanitize_transaction_ok(&mut self, num: u64) {
-        saturating_add_assign!(self.sanitize_transaction_ok, num);
+    pub fn increment_sanitize_transaction_ok(&mut self) {
+        saturating_add_assign!(self.sanitize_transaction_ok, 1);
     }
 
-    pub fn increment_sanitize_transaction_vote_only_mode(&mut self, num: u64) {
-        saturating_add_assign!(self.sanitize_transaction_vote_only_mode, num);
-    }
-
-    pub fn increment_sanitize_transaction_failed_precheck(&mut self, num: u64) {
-        saturating_add_assign!(self.sanitize_transaction_failed_precheck, num);
-    }
-
-    pub fn increment_sanitize_transaction_blacklisted_account(&mut self, num: u64) {
-        saturating_add_assign!(self.sanitize_transaction_blacklisted_account, num);
-    }
-
-    pub fn increment_sanitize_transaction_failed_to_serialize(&mut self, num: u64) {
-        saturating_add_assign!(self.sanitize_transaction_failed_to_serialize, num);
-    }
-
-    pub fn increment_sanitize_transaction_duplicate_transaction(&mut self, num: u64) {
-        saturating_add_assign!(self.sanitize_transaction_duplicate_transaction, num);
-    }
-
-    pub fn increment_sanitize_transaction_failed_check(&mut self, num: u64) {
-        saturating_add_assign!(self.sanitize_transaction_failed_check, num);
-    }
-
-    pub fn increment_sanitize_bundle_elapsed_us(&mut self, num: u64) {
-        saturating_add_assign!(self.sanitize_bundle_elapsed_us, num);
+    pub fn increment_sanitize_error(&mut self, e: DeserializedBundleError) {
+        match e {
+            DeserializedBundleError::VoteOnlyMode => {
+                saturating_add_assign!(self.sanitize_transaction_vote_only_mode, 1);
+            }
+            DeserializedBundleError::FailedPacketBatchPreCheck => {
+                saturating_add_assign!(self.sanitize_transaction_failed_precheck, 1);
+            }
+            DeserializedBundleError::BlacklistedAccount => {
+                saturating_add_assign!(self.sanitize_transaction_blacklisted_account, 1);
+            }
+            DeserializedBundleError::FailedToSerializeTransaction => {
+                saturating_add_assign!(self.sanitize_transaction_failed_to_serialize, 1);
+            }
+            DeserializedBundleError::DuplicateTransaction => {
+                saturating_add_assign!(self.sanitize_transaction_duplicate_transaction, 1);
+            }
+            DeserializedBundleError::FailedCheckTransactions => {
+                saturating_add_assign!(self.sanitize_transaction_failed_check, 1);
+            }
+        }
     }
 
     pub fn increment_locked_bundle_elapsed_us(&mut self, num: u64) {
