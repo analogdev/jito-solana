@@ -12,7 +12,6 @@ use {
             auth::{generate_auth_tokens, maybe_refresh_auth_tokens, AuthInterceptor},
             ProxyError,
         },
-        sigverify::SigverifyTracerPacketStats,
     },
     crossbeam_channel::Sender,
     jito_protos::proto::{

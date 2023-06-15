@@ -3,17 +3,13 @@
 use {
     crate::{
         banking_stage::{
-            committer::{CommitTransactionDetails, Committer},
-            consumer::Consumer,
+            committer::Committer,
             decision_maker::{BufferedPacketsDecision, DecisionMaker},
-            BatchedTransactionDetails,
         },
-        bundle_account_locker::{BundleAccountLocker, BundleAccountLockerResult, LockedBundle},
+        bundle_account_locker::BundleAccountLocker,
         bundle_consumer::BundleConsumer,
-        // bundle_sanitizer::{get_sanitized_bundle, BundleSanitizerError},
         bundle_stage::bundle_packet_receiver::BundleReceiver,
         bundle_stage_leader_stats::BundleStageLeaderStats,
-        consensus_cache_updater::ConsensusCacheUpdater,
         packet_bundle::PacketBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
         qos_service::QosService,
@@ -21,58 +17,27 @@ use {
         unprocessed_transaction_storage::UnprocessedTransactionStorage,
     },
     crossbeam_channel::{Receiver, RecvTimeoutError},
-    solana_entry::entry::hash_transactions,
     solana_gossip::cluster_info::ClusterInfo,
-    solana_ledger::{
-        blockstore_processor::TransactionStatusSender, token_balances::collect_token_balances,
-    },
+    solana_ledger::blockstore_processor::TransactionStatusSender,
     solana_measure::measure,
-    solana_poh::poh_recorder::{
-        BankStart, PohRecorder,
-        PohRecorderError::{self},
-        TransactionRecorder,
-    },
-    solana_program_runtime::timings::ExecuteTimings,
+    solana_poh::poh_recorder::PohRecorder,
     solana_runtime::{
-        account_overrides::AccountOverrides,
-        accounts::TransactionLoadResult,
-        bank::{
-            Bank, CommitTransactionCounts, LoadAndExecuteTransactionsOutput, TransactionBalances,
-            TransactionBalancesSet, TransactionExecutionResult,
-        },
-        bank_forks::BankForks,
-        bank_utils,
-        block_cost_limits::MAX_BLOCK_UNITS,
-        cost_model::{CostModel, TransactionCost},
-        prioritization_fee_cache::PrioritizationFeeCache,
-        transaction_batch::TransactionBatch,
+        block_cost_limits::MAX_BLOCK_UNITS, prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
-    solana_sdk::{
-        bundle::{
-            error::BundleExecutionError, sanitized::SanitizedBundle,
-            utils::check_bundle_lock_results,
-        },
-        clock::{Slot, DEFAULT_TICKS_PER_SLOT, MAX_PROCESSING_AGE},
-        hash::Hash,
-        pubkey::Pubkey,
-        saturating_add_assign,
-        timing::AtomicInterval,
-        transaction::{self, SanitizedTransaction, TransactionError, VersionedTransaction},
-    },
-    solana_transaction_status::token_balances::{
-        TransactionTokenBalances, TransactionTokenBalancesSet,
-    },
+    solana_sdk::{bundle::error::BundleExecutionError, timing::AtomicInterval},
     std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::VecDeque,
         sync::{
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex, RwLock,
         },
-        thread::{self, Builder, JoinHandle},
+        thread::{Builder, JoinHandle},
         time::{Duration, Instant},
     },
 };
+
+use solana_runtime::bank_forks::BankForks;
 
 mod bundle_packet_deserializer;
 mod bundle_packet_receiver;
@@ -349,7 +314,7 @@ impl BundleStage {
 
         // The first 80% of the block, based on poh ticks, has `preallocated_bundle_cost` less compute units.
         // The last 20% has has full compute so blockspace is maximized if BundleStage is idle.
-        let mut reserved_space = BundleReservedSpace {
+        let mut _reserved_space = BundleReservedSpace {
             current_bundle_block_limit: MAX_BLOCK_UNITS,
             current_tx_block_limit: MAX_BLOCK_UNITS.saturating_sub(preallocated_bundle_cost),
             initial_allocated_cost: preallocated_bundle_cost,
@@ -370,7 +335,7 @@ impl BundleStage {
                         &decision_maker,
                         &mut consumer,
                         &mut unprocessed_bundle_storage,
-                        &bundle_stage_stats,
+                        &mut bundle_stage_stats,
                         &mut bundle_stage_leader_stats,
                     ),
                     "process_buffered_packets",
@@ -399,7 +364,7 @@ impl BundleStage {
         decision_maker: &DecisionMaker,
         consumer: &mut BundleConsumer,
         unprocessed_bundle_storage: &mut UnprocessedTransactionStorage,
-        bundle_stage_stats: &BundleStageLoopStats,
+        bundle_stage_loop_stats: &mut BundleStageLoopStats,
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
     ) {
         let (decision, make_decision_time) =
@@ -429,7 +394,7 @@ impl BundleStage {
                     consumer.consume_buffered_bundles(
                         &bank_start,
                         unprocessed_bundle_storage,
-                        bundle_stage_stats,
+                        bundle_stage_loop_stats,
                         bundle_stage_leader_stats,
                     ),
                     "consume_buffered_bundles",

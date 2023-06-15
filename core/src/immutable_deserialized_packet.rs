@@ -1,23 +1,19 @@
-use std::collections::hash_map::RandomState;
 // use crate::bundle_sanitizer::BundleSanitizerError;
 use crate::packet_bundle::PacketBundle;
-use solana_perf::sigverify::verify_packet;
-use solana_runtime::bank::Bank;
-use solana_runtime::transaction_error_metrics::TransactionErrorMetrics;
-use solana_sdk::bundle::sanitized::SanitizedBundle;
-use solana_sdk::clock::MAX_PROCESSING_AGE;
-use solana_sdk::pubkey::Pubkey;
-use std::collections::HashSet;
-use std::iter::repeat;
 use {
-    solana_perf::packet::Packet,
-    solana_runtime::transaction_priority_details::{
-        GetTransactionPriorityDetails, TransactionPriorityDetails,
+    solana_perf::{packet::Packet, sigverify::verify_packet},
+    solana_runtime::{
+        bank::Bank,
+        transaction_error_metrics::TransactionErrorMetrics,
+        transaction_priority_details::{GetTransactionPriorityDetails, TransactionPriorityDetails},
     },
     solana_sdk::{
+        bundle::sanitized::SanitizedBundle,
+        clock::MAX_PROCESSING_AGE,
         feature_set,
         hash::Hash,
         message::Message,
+        pubkey::Pubkey,
         sanitize::SanitizeError,
         short_vec::decode_shortu16_len,
         signature::Signature,
@@ -26,7 +22,13 @@ use {
             VersionedTransaction,
         },
     },
-    std::{cmp::Ordering, mem::size_of, sync::Arc},
+    std::{
+        cmp::Ordering,
+        collections::{hash_map::RandomState, HashSet},
+        iter::repeat,
+        mem::size_of,
+        sync::Arc,
+    },
     thiserror::Error,
 };
 
@@ -240,6 +242,11 @@ impl DeserializedBundlePackets {
         self.packets.len()
     }
 
+    /// A bundle has the following requirements:
+    /// - all transactions must be sanitiz-able
+    /// - no duplicate signatures
+    /// - must not contain a blacklisted account
+    /// - can't already be processed or contain a bad blockhash
     pub fn build_sanitized_bundle(
         &self,
         bank: &Bank,
@@ -299,7 +306,30 @@ impl DeserializedBundlePackets {
 mod tests {
     use {
         super::*,
+        crate::{
+            bundle_sanitizer::{get_sanitized_bundle, MAX_PACKETS_PER_BUNDLE},
+            packet_bundle::PacketBundle,
+            tip_manager::{TipDistributionAccountConfig, TipManager, TipManagerConfig},
+        },
+        solana_address_lookup_table_program::instruction::create_lookup_table,
+        solana_ledger::genesis_utils::create_genesis_config,
+        solana_perf::packet::PacketBatch,
+        solana_runtime::{
+            bank::Bank, genesis_utils::GenesisConfigInfo,
+            transaction_error_metrics::TransactionErrorMetrics,
+        },
+        solana_sdk::{
+            bundle::sanitized::derive_bundle_id,
+            hash::Hash,
+            instruction::Instruction,
+            packet::Packet,
+            pubkey::Pubkey,
+            signature::{Keypair, Signer},
+            system_transaction::transfer,
+            transaction::{Transaction, VersionedTransaction},
+        },
         solana_sdk::{signature::Keypair, system_transaction},
+        std::{collections::HashSet, sync::Arc},
     };
 
     #[test]
@@ -315,4 +345,439 @@ mod tests {
 
         assert!(matches!(deserialized_packet, Ok(_)));
     }
+    // #[test]
+    // fn test_simple_get_sanitized_bundle() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo {
+    //         genesis_config,
+    //         mint_keypair,
+    //         ..
+    //     } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //
+    //     let tx = VersionedTransaction::from(transfer(
+    //         &mint_keypair,
+    //         &kp.pubkey(),
+    //         1,
+    //         genesis_config.hash(),
+    //     ));
+    //     let packet = Packet::from_data(None, &tx).unwrap();
+    //     let tx_signature = tx.signatures[0];
+    //     let bundle_id = derive_bundle_id(&vec![tx]);
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet]),
+    //         bundle_id,
+    //     };
+    //
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     let sanitized_bundle = get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors,
+    //     )
+    //         .unwrap();
+    //     assert_eq!(sanitized_bundle.transactions.len(), 1);
+    //     assert_eq!(sanitized_bundle.transactions[0].signature(), &tx_signature);
+    // }
+    //
+    // #[test]
+    // fn test_fail_to_sanitize_consensus_account() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo {
+    //         genesis_config,
+    //         mint_keypair,
+    //         ..
+    //     } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //
+    //     let tx = VersionedTransaction::from(transfer(
+    //         &mint_keypair,
+    //         &kp.pubkey(),
+    //         1,
+    //         genesis_config.hash(),
+    //     ));
+    //     let packet = Packet::from_data(None, &tx).unwrap();
+    //     let bundle_id = derive_bundle_id(&vec![tx]);
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet]),
+    //         bundle_id,
+    //     };
+    //
+    //     let consensus_accounts_cache = HashSet::from([kp.pubkey()]);
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &consensus_accounts_cache,
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
+    //
+    // #[test]
+    // fn test_fail_to_sanitize_duplicate_transaction() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo {
+    //         genesis_config,
+    //         mint_keypair,
+    //         ..
+    //     } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //
+    //     let tx = VersionedTransaction::from(transfer(
+    //         &mint_keypair,
+    //         &kp.pubkey(),
+    //         1,
+    //         genesis_config.hash(),
+    //     ));
+    //     let packet = Packet::from_data(None, &tx).unwrap();
+    //     let bundle_id = derive_bundle_id(&vec![tx]);
+    //
+    //     // bundle with a duplicate transaction
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet.clone(), packet]),
+    //         bundle_id,
+    //     };
+    //
+    //     // fails to pop because bundle it locks the same transaction twice
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
+    //
+    // #[test]
+    // fn test_fails_to_sanitize_bad_blockhash() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo {
+    //         genesis_config,
+    //         mint_keypair,
+    //         ..
+    //     } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //
+    //     let tx =
+    //         VersionedTransaction::from(transfer(&mint_keypair, &kp.pubkey(), 1, Hash::default()));
+    //     let packet = Packet::from_data(None, &tx).unwrap();
+    //     let bundle_id = derive_bundle_id(&vec![tx]);
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet.clone(), packet]),
+    //         bundle_id,
+    //     };
+    //
+    //     // fails to pop because bundle has bad blockhash
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
+    //
+    // #[test]
+    // fn test_fails_to_sanitize_already_processed() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo {
+    //         genesis_config,
+    //         mint_keypair,
+    //         ..
+    //     } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //
+    //     let tx = VersionedTransaction::from(transfer(
+    //         &mint_keypair,
+    //         &kp.pubkey(),
+    //         1,
+    //         genesis_config.hash(),
+    //     ));
+    //     let packet = Packet::from_data(None, &tx).unwrap();
+    //     let bundle_id = derive_bundle_id(&vec![tx]);
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet.clone()]),
+    //         bundle_id: bundle_id.clone(),
+    //     };
+    //
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     let sanitized_bundle = get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors,
+    //     )
+    //         .unwrap();
+    //
+    //     let results = bank.process_entry_transactions(
+    //         sanitized_bundle
+    //             .transactions
+    //             .into_iter()
+    //             .map(|tx| tx.to_versioned_transaction())
+    //             .collect(),
+    //     );
+    //     assert_eq!(results.len(), 1);
+    //     assert_eq!(results[0], Ok(()));
+    //
+    //     // try to process the same one again shall fail
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet]),
+    //         bundle_id,
+    //     };
+    //
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
+    //
+    // #[test]
+    // fn test_fails_to_sanitize_bundle_tip_program() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let tip_manager = TipManager::new(TipManagerConfig {
+    //         tip_payment_program_id: Pubkey::new_unique(),
+    //         tip_distribution_program_id: Pubkey::new_unique(),
+    //         tip_distribution_account_config: TipDistributionAccountConfig {
+    //             merkle_root_upload_authority: Pubkey::new_unique(),
+    //             vote_account: Pubkey::new_unique(),
+    //             commission_bps: 0,
+    //         },
+    //     });
+    //
+    //     let kp = Keypair::new();
+    //     let tx = VersionedTransaction::from(Transaction::new_signed_with_payer(
+    //         &[Instruction::new_with_bytes(
+    //             tip_manager.tip_payment_program_id(),
+    //             &[0],
+    //             vec![],
+    //         )],
+    //         Some(&kp.pubkey()),
+    //         &[&kp],
+    //         genesis_config.hash(),
+    //     ));
+    //     tx.sanitize(false).unwrap();
+    //     let packet = Packet::from_data(None, &tx).unwrap();
+    //     let bundle_id = derive_bundle_id(&vec![tx]);
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet]),
+    //         bundle_id,
+    //     };
+    //
+    //     // fails to pop because bundle mentions tip program
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::from_iter([tip_manager.tip_payment_program_id()]),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
+    //
+    // #[test]
+    // fn test_txv2_sanitized_bundle_ok() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //     let tx = VersionedTransaction::from(Transaction::new_signed_with_payer(
+    //         &[create_lookup_table(kp.pubkey(), kp.pubkey(), bank.slot()).0],
+    //         Some(&kp.pubkey()),
+    //         &[&kp],
+    //         genesis_config.hash(),
+    //     ));
+    //     tx.sanitize(false).unwrap();
+    //     let packet = Packet::from_data(None, &tx).unwrap();
+    //     let bundle_id = derive_bundle_id(&vec![tx]);
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet]),
+    //         bundle_id,
+    //     };
+    //
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_ok());
+    // }
+    //
+    // #[test]
+    // fn test_fails_to_sanitize_empty_bundle() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![]),
+    //         bundle_id: String::default(),
+    //     };
+    //     // fails to pop because empty bundle
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
+    //
+    // #[test]
+    // fn test_fails_to_sanitize_too_many_packets() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo {
+    //         genesis_config,
+    //         mint_keypair,
+    //         ..
+    //     } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //
+    //     let txs = (0..MAX_PACKETS_PER_BUNDLE + 1)
+    //         .map(|i| {
+    //             VersionedTransaction::from(transfer(
+    //                 &mint_keypair,
+    //                 &kp.pubkey(),
+    //                 i as u64,
+    //                 genesis_config.hash(),
+    //             ))
+    //         })
+    //         .collect::<Vec<_>>();
+    //     let packets = txs.iter().map(|tx| Packet::from_data(None, tx).unwrap());
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(packets.collect()),
+    //         bundle_id: derive_bundle_id(&txs),
+    //     };
+    //     // fails to pop because too many packets in a bundle
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
+    //
+    // #[test]
+    // fn test_fails_to_sanitize_discarded() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo {
+    //         genesis_config,
+    //         mint_keypair,
+    //         ..
+    //     } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //
+    //     let tx = VersionedTransaction::from(transfer(
+    //         &mint_keypair,
+    //         &kp.pubkey(),
+    //         1,
+    //         genesis_config.hash(),
+    //     ));
+    //     let mut packet = Packet::from_data(None, &tx).unwrap();
+    //     packet.meta_mut().set_discard(true);
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet]),
+    //         bundle_id: derive_bundle_id(&vec![tx]),
+    //     };
+    //
+    //     // fails to pop because one of the packets is marked as discard
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
+    //
+    // #[test]
+    // fn test_fails_to_sanitize_bad_sigverify() {
+    //     solana_logger::setup();
+    //     let GenesisConfigInfo {
+    //         genesis_config,
+    //         mint_keypair,
+    //         ..
+    //     } = create_genesis_config(2);
+    //     let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+    //
+    //     let kp = Keypair::new();
+    //
+    //     let mut tx = VersionedTransaction::from(transfer(
+    //         &mint_keypair,
+    //         &kp.pubkey(),
+    //         1,
+    //         genesis_config.hash(),
+    //     ));
+    //
+    //     let _ = tx.signatures.pop();
+    //
+    //     let bad_kp = Keypair::new();
+    //     let serialized = tx.message.serialize();
+    //     let bad_sig = bad_kp.sign_message(&serialized);
+    //     tx.signatures.push(bad_sig);
+    //
+    //     let packet = Packet::from_data(None, &tx).unwrap();
+    //
+    //     let packet_bundle = PacketBundle {
+    //         batch: PacketBatch::new(vec![packet]),
+    //         bundle_id: derive_bundle_id(&vec![tx]),
+    //     };
+    //     let mut transaction_errors = TransactionErrorMetrics::default();
+    //     assert!(get_sanitized_bundle(
+    //         &packet_bundle,
+    //         &bank,
+    //         &HashSet::default(),
+    //         &HashSet::default(),
+    //         &mut transaction_errors
+    //     )
+    //         .is_err());
+    // }
 }

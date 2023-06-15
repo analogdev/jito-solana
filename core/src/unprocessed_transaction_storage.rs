@@ -1,10 +1,8 @@
 use {
     crate::{
         banking_stage::{BankingStageStats, FilterForwardingResults, ForwardOption},
-        bundle_account_locker::LockedBundle,
-        // bundle_sanitizer::{get_sanitized_bundle, BundleSanitizerError},
         bundle_stage::BundleStageLoopStats,
-        bundle_stage_leader_stats::{BundleStageLeaderStats, BundleStageStats},
+        bundle_stage_leader_stats::BundleStageLeaderStats,
         forward_packet_batches_by_accounts::ForwardPacketBatchesByAccounts,
         immutable_deserialized_packet::{DeserializedBundlePackets, ImmutableDeserializedPacket},
         latest_unprocessed_votes::{
@@ -13,7 +11,6 @@ use {
         },
         leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
         multi_iterator_scanner::{MultiIteratorScanner, ProcessingDecision},
-        packet_bundle::PacketBundle,
         read_write_account_set::ReadWriteAccountSet,
         unprocessed_packet_batches::{
             DeserializedPacket, PacketBatchInsertionMetrics, UnprocessedPacketBatches,
@@ -29,7 +26,6 @@ use {
         transaction::SanitizedTransaction,
     },
     std::{
-        cmp::min,
         collections::{HashMap, HashSet, VecDeque},
         sync::{atomic::Ordering, Arc},
     },
@@ -423,13 +419,16 @@ impl UnprocessedTransactionStorage {
     pub fn process_bundles<F>(
         &mut self,
         bank: Arc<Bank>,
-        bundle_stage_loop_stats: &BundleStageLoopStats,
+        bundle_stage_loop_stats: &mut BundleStageLoopStats,
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
         blacklisted_accounts: &HashSet<Pubkey>,
         processing_function: F,
     ) -> bool
     where
-        F: FnMut(&DeserializedBundlePackets, &LockedBundle) -> Option<Vec<usize>>,
+        F: FnMut(
+            &[(DeserializedBundlePackets, SanitizedBundle)],
+            &mut BundleStageLeaderStats,
+        ) -> Vec<usize>,
     {
         match self {
             UnprocessedTransactionStorage::BundleStorage(bundle_storage) => bundle_storage
@@ -1126,32 +1125,49 @@ impl BundleStorage {
     pub fn process_bundles<F>(
         &mut self,
         bank: Arc<Bank>,
-        bundle_stage_loop_stats: &BundleStageLoopStats,
+        bundle_stage_loop_stats: &mut BundleStageLoopStats,
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
         blacklisted_accounts: &HashSet<Pubkey>,
         mut processing_function: F,
     ) -> bool
     where
-        F: FnMut(&DeserializedBundlePackets, &LockedBundle) -> Option<Vec<usize>>,
+        F: FnMut(
+            &[(DeserializedBundlePackets, SanitizedBundle)],
+            &mut BundleStageLeaderStats,
+        ) -> Vec<usize>,
     {
-        let mut transaction_errors = TransactionErrorMetrics::default();
+        let sanitized_bundles = self.drain_and_sanitize_bundles(
+            bank,
+            bundle_stage_loop_stats,
+            bundle_stage_leader_stats,
+            blacklisted_accounts,
+        );
+
+        let response = processing_function(&sanitized_bundles, bundle_stage_leader_stats);
+
+        true
+    }
+
+    /// Drains the unprocessed_bundle_storage, converting bundle packets into SanitizedBundles
+    fn drain_and_sanitize_bundles(
+        &mut self,
+        bank: Arc<Bank>,
+        _bundle_stage_loop_stats: &mut BundleStageLoopStats,
+        bundle_stage_leader_stats: &mut BundleStageLeaderStats,
+        blacklisted_accounts: &HashSet<Pubkey>,
+    ) -> Vec<(DeserializedBundlePackets, SanitizedBundle)> {
+        let mut error_metrics = TransactionErrorMetrics::default();
 
         let (sanitized_bundles, sanitized_bundle_elapsed) = measure!(
             self.unprocessed_bundle_storage
                 .drain(..)
                 .into_iter()
                 .filter_map(|packet_bundle| {
-                    let mut error_metrics = TransactionErrorMetrics::default();
                     let r = packet_bundle.build_sanitized_bundle(
                         &bank,
                         blacklisted_accounts,
                         &mut error_metrics,
                     );
-
-                    bundle_stage_leader_stats
-                        .leader_slot_metrics_tracker()
-                        .accumulate_transaction_errors(&error_metrics);
-
                     match r {
                         Ok(sanitized_bundle) => {
                             bundle_stage_leader_stats
@@ -1167,15 +1183,18 @@ impl BundleStorage {
                         }
                     }
                 })
-                .collect::<VecDeque<(_, _)>>(),
+                .collect::<Vec<(_, _)>>(),
             "sanitized_bundle_elapsed"
         );
 
         bundle_stage_leader_stats
             .leader_slot_metrics_tracker()
-            .accumulate_transaction_errors(&transaction_errors);
+            .accumulate_transaction_errors(&error_metrics);
+        bundle_stage_leader_stats
+            .bundle_stage_stats()
+            .increment_sanitize_bundle_elapsed_us(sanitized_bundle_elapsed.as_us());
 
-        true
+        sanitized_bundles
     }
 }
 

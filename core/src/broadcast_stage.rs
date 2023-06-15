@@ -412,7 +412,7 @@ pub fn broadcast_shreds(
     cluster_info: &ClusterInfo,
     bank_forks: &RwLock<BankForks>,
     socket_addr_space: &SocketAddrSpace,
-    shred_receiver_address: &Option<SocketAddr>,
+    _shred_receiver_address: &Option<SocketAddr>,
 ) -> Result<()> {
     let mut result = Ok(());
     let mut shred_select = Measure::start("shred_select");

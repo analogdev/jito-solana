@@ -16,7 +16,6 @@ pub mod banking_trace;
 pub mod broadcast_stage;
 pub mod bundle_account_locker;
 pub mod bundle_consumer;
-pub mod bundle_sanitizer;
 pub mod bundle_stage;
 mod bundle_stage_leader_stats;
 pub mod cache_block_meta_service;

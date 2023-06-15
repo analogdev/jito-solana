@@ -1,11 +1,9 @@
+use solana_gossip::contact_info;
 use {
     crate::proxy::{HeartbeatEvent, ProxyError},
     crossbeam_channel::{select, tick, Receiver, Sender},
     solana_client::connection_cache::Protocol,
-    solana_gossip::{
-        cluster_info::ClusterInfo,
-        contact_info::{self, ContactInfo},
-    },
+    solana_gossip::cluster_info::ClusterInfo,
     solana_perf::packet::PacketBatch,
     std::{
         net::SocketAddr,

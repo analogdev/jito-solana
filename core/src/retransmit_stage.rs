@@ -28,7 +28,7 @@ use {
     },
     std::{
         collections::HashMap,
-        iter::{self, once, repeat},
+        iter::repeat,
         net::{SocketAddr, UdpSocket},
         ops::AddAssign,
         sync::{

@@ -10,7 +10,7 @@ use {
     solana_runtime::{
         bank::Bank,
         cost_model::{CostModel, TransactionCost},
-        cost_tracker::{CostTracker, CostTrackerError},
+        cost_tracker::CostTracker,
     },
     solana_sdk::{
         clock::Slot,

@@ -1,21 +1,26 @@
 use {
     crate::{
-        banking_stage::{committer::Committer, BankingStageStats},
+        banking_stage::committer::Committer,
         bundle_account_locker::{BundleAccountLocker, LockedBundle},
         bundle_stage::BundleStageLoopStats,
         bundle_stage_leader_stats::BundleStageLeaderStats,
         consensus_cache_updater::ConsensusCacheUpdater,
         immutable_deserialized_packet::DeserializedBundlePackets,
-        leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
         qos_service::QosService,
         tip_manager::TipManager,
         unprocessed_transaction_storage::UnprocessedTransactionStorage,
     },
     solana_gossip::cluster_info::ClusterInfo,
-    solana_measure::measure::Measure,
+    solana_measure::{measure, measure::Measure},
     solana_poh::poh_recorder::{BankStart, TransactionRecorder},
-    solana_sdk::{clock::Slot, pubkey::Pubkey, timing::timestamp},
+    solana_runtime::bank::Bank,
+    solana_sdk::{
+        bundle::{error::BundleExecutionError, sanitized::SanitizedBundle},
+        clock::Slot,
+        pubkey::Pubkey,
+        timing::timestamp,
+    },
     std::{
         collections::HashSet,
         sync::{Arc, Mutex},
@@ -103,7 +108,7 @@ impl BundleConsumer {
         &mut self,
         bank_start: &BankStart,
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
-        bundle_stage_stats: &BundleStageLoopStats,
+        bundle_stage_loop_stats: &mut BundleStageLoopStats,
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
     ) {
         self.maybe_update_blacklist(bank_start);
@@ -113,19 +118,19 @@ impl BundleConsumer {
         //  else, make sure to update the reserved compute cost
         // TODO (LB): execute bundles until empty or end of slot
 
-        let mut rebuffered_packet_count = 0;
+        // let mut rebuffered_packet_count = 0;
         let mut consumed_buffered_packets_count = 0;
-        let mut consume_buffered_bundles_count = 0;
+        // let mut consume_buffered_bundles_count = 0;
         let mut proc_start = Measure::start("consume_buffered_process");
         let num_bundles_to_process = unprocessed_transaction_storage.len();
 
         let reached_end_of_slot = unprocessed_transaction_storage.process_bundles(
             bank_start.working_bank.clone(),
-            bundle_stage_stats,
+            bundle_stage_loop_stats,
             bundle_stage_leader_stats,
             &self.blacklisted_accounts,
-            |deserialized_bundle_packets, bundle| {
-                self.do_process_bundles(deserialized_bundle_packets, bundle)
+            |bundles, bundle_stage_leader_stats| {
+                self.do_process_bundles(bundles, bank_start, bundle_stage_leader_stats)
             },
         );
 
@@ -166,10 +171,119 @@ impl BundleConsumer {
     }
 
     fn do_process_bundles(
-        &mut self,
-        deserialized_bundle_packets: &DeserializedBundlePackets,
-        bundle: &LockedBundle,
-    ) -> Option<Vec<usize>> {
-        None
+        &self,
+        bundles: &[(DeserializedBundlePackets, SanitizedBundle)],
+        bank_start: &BankStart,
+        bundle_stage_leader_stats: &mut BundleStageLeaderStats,
+    ) -> Vec<usize> {
+        // BundleAccountLocker holds RW locks for ALL accounts in ALL transactions within a single bundle.
+        // By pre-locking bundles before they're ready to be processed, it will prevent BankingStage from
+        // grabbing those locks so BundleStage can process as fast as possible.
+        // A LockedBundle is similar to TransactionBatch; once its dropped the locks are released.
+        #[allow(clippy::needless_collect)]
+        let (locked_bundle_results, locked_bundles_elapsed) = measure!(
+            bundles
+                .iter()
+                .map(|(_, sanitized_bundle)| {
+                    self.bundle_account_locker
+                        .prepare_locked_bundle(sanitized_bundle, &bank_start.working_bank)
+                })
+                .collect::<Vec<_>>(),
+            "locked_bundles_elapsed"
+        );
+        bundle_stage_leader_stats
+            .bundle_stage_stats()
+            .increment_locked_bundle_elapsed_us(locked_bundles_elapsed.as_us());
+
+        // into_iter so that LockedBundles are dropped, releasing the locks from BankingStage
+        let _execution_results: Vec<_> = locked_bundle_results
+            .into_iter()
+            .map(|r| match r {
+                Ok(locked_bundle) => self.process_bundle(&locked_bundle, bank_start),
+                Err(_e) => {
+                    // TODO (LB): accumulate error, translate to another error
+                    Ok(())
+                }
+            })
+            .collect();
+
+        // TODO (LB): loop through locked bundles
+        vec![]
+    }
+
+    fn process_bundle(
+        &self,
+        locked_bundle: &LockedBundle,
+        bank_start: &BankStart,
+    ) -> Result<(), BundleExecutionError> {
+        if !Bank::should_bank_still_be_processing_txs(
+            &bank_start.bank_creation_time,
+            bank_start.working_bank.ns_per_slot,
+        ) {
+            return Err(BundleExecutionError::PohMaxHeightError);
+        }
+
+        self.handle_tip_programs(locked_bundle, bank_start)?;
+
+        // TODO (LB): can cache tip accounts somewhere
+
+        Ok(())
+    }
+
+    fn handle_tip_programs(
+        &self,
+        locked_bundle: &LockedBundle,
+        bank_start: &BankStart,
+    ) -> Result<(), BundleExecutionError> {
+        if !Self::bundle_touches_tip_pdas(
+            locked_bundle.sanitized_bundle(),
+            &self.tip_manager.get_tip_accounts(),
+        ) || bank_start.working_bank.slot() == self.last_tip_update_slot
+        {
+            return Ok(());
+        }
+
+        //                         Self::maybe_initialize_tip_accounts(
+        //                             bundle_account_locker,
+        //                             bank_start,
+        //                             cluster_info,
+        //                             recorder,
+        //                             transaction_status_sender,
+        //                             gossip_vote_sender,
+        //                             qos_service,
+        //                             tip_manager,
+        //                             max_bundle_retry_duration,
+        //                             bundle_stage_leader_stats,
+        //                             reserved_space,
+        //                         )?;
+        //
+        //                         Self::maybe_change_tip_receiver(
+        //                             bundle_account_locker,
+        //                             bank_start,
+        //                             cluster_info,
+        //                             recorder,
+        //                             transaction_status_sender,
+        //                             gossip_vote_sender,
+        //                             qos_service,
+        //                             tip_manager,
+        //                             max_bundle_retry_duration,
+        //                             bundle_stage_leader_stats,
+        //                             block_builder_fee_info,
+        //                             reserved_space,
+        //                         )?;
+        //
+        //                         *last_tip_update_slot = bank_start.working_bank.slot();
+
+        Ok(())
+    }
+
+    /// Returns true if any of the transactions in a bundle mention one of the tip PDAs
+    fn bundle_touches_tip_pdas(bundle: &SanitizedBundle, tip_pdas: &HashSet<Pubkey>) -> bool {
+        bundle.transactions.iter().any(|tx| {
+            tx.message()
+                .account_keys()
+                .iter()
+                .any(|a| tip_pdas.contains(a))
+        })
     }
 }

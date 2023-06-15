@@ -1,12 +1,8 @@
-// use crate::bundle_sanitizer::BundleSanitizerError;
-use crate::immutable_deserialized_packet::DeserializedBundleError;
 use {
     crate::{
+        immutable_deserialized_packet::DeserializedBundleError,
         leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
-        leader_slot_banking_stage_timing_metrics::LeaderExecuteAndCommitTimings,
     },
-    solana_poh::poh_recorder::BankStart,
-    solana_runtime::transaction_error_metrics::TransactionErrorMetrics,
     solana_sdk::{clock::Slot, saturating_add_assign},
 };
 
@@ -34,7 +30,7 @@ impl BundleStageLeaderStats {
     }
 
     pub fn report(&self, id: u32, slot: Slot) {
-        // self.bundle_stage_stats.report(id, slot);
+        self.bundle_stage_stats.report(id, slot);
     }
 }
 
@@ -210,11 +206,30 @@ impl BundleStageStats {
             DeserializedBundleError::FailedCheckTransactions => {
                 saturating_add_assign!(self.sanitize_transaction_failed_check, 1);
             }
+            DeserializedBundleError::FailedToSerializePacket => {
+                saturating_add_assign!(self.sanitize_transaction_failed_to_serialize, 1);
+            }
+            DeserializedBundleError::EmptyBatch => {
+                // TODO (LB)
+            }
+            DeserializedBundleError::TooManyPackets => {
+                // TODO (LB)
+            }
+            DeserializedBundleError::MarkedDiscard => {
+                // TODO (LB)
+            }
+            DeserializedBundleError::SignatureVerificationFailure => {
+                // TODO (LB)
+            }
         }
     }
 
     pub fn increment_locked_bundle_elapsed_us(&mut self, num: u64) {
         saturating_add_assign!(self.locked_bundle_elapsed_us, num);
+    }
+
+    pub fn increment_sanitize_bundle_elapsed_us(&mut self, num: u64) {
+        saturating_add_assign!(self.sanitize_bundle_elapsed_us, num);
     }
 
     pub fn increment_num_lock_errors(&mut self, num: u64) {

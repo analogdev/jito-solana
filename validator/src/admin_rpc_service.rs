@@ -36,7 +36,7 @@ use {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         str::FromStr,
-        sync::{Arc, Mutex, RwLock},
+        sync::{Arc, RwLock},
         thread::{self, Builder},
         time::{Duration, SystemTime},
     },
