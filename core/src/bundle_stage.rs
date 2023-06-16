@@ -263,18 +263,6 @@ impl BundleStage {
         );
         let decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
 
-        let consumer = BundleConsumer::new(
-            committer,
-            poh_recorder.read().unwrap().new_recorder(),
-            QosService::new(BUNDLE_STAGE_ID),
-            log_message_bytes_limit,
-            tip_manager,
-            bundle_account_locker,
-            block_builder_fee_info.clone(),
-            max_bundle_retry_duration,
-            cluster_info,
-        );
-
         let unprocessed_bundle_storage = UnprocessedTransactionStorage::new_bundle_storage(
             VecDeque::with_capacity(1_000),
             VecDeque::with_capacity(1_000),
@@ -283,6 +271,18 @@ impl BundleStage {
         let bundle_thread = Builder::new()
             .name("solBundleStgTx".to_string())
             .spawn(move || {
+                let consumer = BundleConsumer::new(
+                    committer,
+                    poh_recorder.read().unwrap().new_recorder(),
+                    QosService::new(BUNDLE_STAGE_ID),
+                    log_message_bytes_limit,
+                    tip_manager,
+                    bundle_account_locker,
+                    block_builder_fee_info.clone(),
+                    max_bundle_retry_duration,
+                    cluster_info,
+                );
+
                 Self::process_loop(
                     &mut bundle_receiver,
                     decision_maker,
@@ -381,8 +381,7 @@ impl BundleStage {
             // BufferedPacketsDecision::Consume means this leader is scheduled to be running at the moment.
             // Execute, record, and commit as many bundles possible given time, compute, and other constraints.
             BufferedPacketsDecision::Consume(bank_start) => {
-                // TODO (LB): look at leader_slot_metrics_tracker logic to determine if report happened,
-                //  and report bundle stage specific metrics
+                // TODO (LB): need to make sure to report bundle_stage_leader_stats with the apply_action
                 // Take metrics action before consume packets (potentially resetting the
                 // slot metrics tracker to the next slot) so that we don't count the
                 // packet processing metrics from the next slot towards the metrics

@@ -1,3 +1,6 @@
+use crate::proxy::block_engine_stage::BlockBuilderFeeInfo;
+use solana_sdk::bundle::sanitized::SanitizedBundle;
+use std::sync::Mutex;
 use {
     anchor_lang::{
         solana_program::hash::Hash, AccountDeserialize, InstructionData, ToAccountMetas,
@@ -291,7 +294,7 @@ impl TipManager {
     pub fn initialize_tip_distribution_config_tx(
         &self,
         recent_blockhash: Hash,
-        cluster_info: &Arc<ClusterInfo>,
+        cluster_info: &ClusterInfo,
     ) -> SanitizedTransaction {
         let ix = initialize_ix(
             self.tip_distribution_program_info.program_id,
@@ -323,7 +326,7 @@ impl TipManager {
         &self,
         recent_blockhash: Hash,
         epoch: Epoch,
-        cluster_info: &Arc<ClusterInfo>,
+        cluster_info: &ClusterInfo,
     ) -> SanitizedTransaction {
         let (tip_distribution_account, bump) = derive_tip_distribution_account_address(
             &self.tip_distribution_program_info.program_id,
@@ -459,5 +462,106 @@ impl TipManager {
                 }))
             })
             .collect()
+    }
+
+    /// Return a bundle that is capable of calling the initialize instructions on the two tip payment programs
+    /// This is mainly helpful for local development and shouldn't run on testnet and mainnet, assuming the
+    /// correct TipManager configuration is set.
+    pub fn get_initialize_tip_programs_bundle(
+        &self,
+        bank: &Bank,
+        cluster_info: &ClusterInfo,
+    ) -> Option<SanitizedBundle> {
+        let maybe_init_tip_payment_config_tx =
+            if self.should_initialize_tip_payment_program(bank) {
+                info!("building initialize_tip_payment_program_tx");
+                Some(self.initialize_tip_payment_program_tx(
+                    bank.last_blockhash(),
+                    &cluster_info.keypair(),
+                ))
+            } else {
+                None
+            };
+
+        let maybe_init_tip_distro_config_tx = if self
+            .should_initialize_tip_distribution_config(bank)
+        {
+            info!("building initialize_tip_distribution_config_tx");
+            Some(self.initialize_tip_distribution_config_tx(bank.last_blockhash(), cluster_info))
+        } else {
+            None
+        };
+
+        let transactions = [
+            maybe_init_tip_payment_config_tx,
+            maybe_init_tip_distro_config_tx,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<SanitizedTransaction>>();
+
+        if transactions.is_empty() {
+            None
+        } else {
+            Some(SanitizedBundle {
+                transactions,
+                // TODO (LB): calculate this
+                bundle_id: String::default(),
+            })
+        }
+    }
+
+    pub fn get_tip_programs_crank_bundle(
+        &self,
+        bank: &Bank,
+        cluster_info: &ClusterInfo,
+        block_builder_fee_info: &BlockBuilderFeeInfo,
+    ) -> Result<Option<SanitizedBundle>> {
+        let maybe_init_tip_distro_account_tx = if self.should_init_tip_distribution_account(bank) {
+            info!("initializing TDA for epoch {}", bank.epoch());
+            Some(self.initialize_tip_distribution_account_tx(
+                bank.last_blockhash(),
+                bank.epoch(),
+                cluster_info,
+            ))
+        } else {
+            None
+        };
+
+        let configured_tip_receiver = self.get_configured_tip_receiver(&bank)?;
+        let my_tip_receiver = self.get_my_tip_distribution_pda(bank.epoch());
+        let maybe_change_tip_receiver_tx = if configured_tip_receiver != my_tip_receiver {
+            info!(
+                "changing tip receiver from {} to {}",
+                configured_tip_receiver, my_tip_receiver
+            );
+            Some(self.change_tip_receiver_and_block_builder_tx(
+                &my_tip_receiver,
+                bank,
+                &cluster_info.keypair(),
+                &block_builder_fee_info.block_builder,
+                block_builder_fee_info.block_builder_commission,
+            )?)
+        } else {
+            None
+        };
+
+        let transactions = [
+            maybe_init_tip_distro_account_tx,
+            maybe_change_tip_receiver_tx,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<SanitizedTransaction>>();
+
+        if transactions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(SanitizedBundle {
+                transactions,
+                // TODO (LB): calculate this
+                bundle_id: String::default(),
+            }))
+        }
     }
 }

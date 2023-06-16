@@ -39,6 +39,9 @@ pub enum TipPaymentError {
 
     #[error("Anchor error: {0}")]
     AnchorError(String),
+
+    #[error("Lock error")]
+    LockError,
 }
 
 impl From<anchor_lang::error::Error> for TipPaymentError {
