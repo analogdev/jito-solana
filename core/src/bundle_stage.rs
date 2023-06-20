@@ -268,21 +268,21 @@ impl BundleStage {
             VecDeque::with_capacity(1_000),
         );
 
+        let consumer = BundleConsumer::new(
+            committer,
+            poh_recorder.read().unwrap().new_recorder(),
+            QosService::new(BUNDLE_STAGE_ID),
+            log_message_bytes_limit,
+            tip_manager,
+            bundle_account_locker,
+            block_builder_fee_info.clone(),
+            max_bundle_retry_duration,
+            cluster_info,
+        );
+
         let bundle_thread = Builder::new()
             .name("solBundleStgTx".to_string())
             .spawn(move || {
-                let consumer = BundleConsumer::new(
-                    committer,
-                    poh_recorder.read().unwrap().new_recorder(),
-                    QosService::new(BUNDLE_STAGE_ID),
-                    log_message_bytes_limit,
-                    tip_manager,
-                    bundle_account_locker,
-                    block_builder_fee_info.clone(),
-                    max_bundle_retry_duration,
-                    cluster_info,
-                );
-
                 Self::process_loop(
                     &mut bundle_receiver,
                     decision_maker,

@@ -108,7 +108,7 @@ impl BundleConsumer {
     // A bundle is not allowed to touch consensus-related accounts
     //  - This is to avoid stalling the voting BankingStage threads.
     pub fn consume_buffered_bundles(
-        &self,
+        &mut self,
         bank_start: &BankStart,
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
         bundle_stage_loop_stats: &mut BundleStageLoopStats,
@@ -133,7 +133,16 @@ impl BundleConsumer {
             bundle_stage_leader_stats,
             &self.blacklisted_accounts.clone(),
             |bundles, bundle_stage_leader_stats| {
-                self.do_process_bundles(bundles, bank_start, bundle_stage_leader_stats)
+                Self::do_process_bundles(
+                    &self.bundle_account_locker,
+                    &self.tip_manager,
+                    &mut self.last_tip_update_slot,
+                    &self.cluster_info,
+                    &self.block_builder_fee_info,
+                    bundles,
+                    bank_start,
+                    bundle_stage_leader_stats,
+                )
             },
         );
 
@@ -174,7 +183,11 @@ impl BundleConsumer {
     }
 
     fn do_process_bundles(
-        &mut self,
+        bundle_account_locker: &BundleAccountLocker,
+        tip_manager: &TipManager,
+        last_tip_updated_slot: &mut Slot,
+        cluster_info: &Arc<ClusterInfo>,
+        block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         bundles: &[(DeserializedBundlePackets, SanitizedBundle)],
         bank_start: &BankStart,
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
@@ -183,44 +196,48 @@ impl BundleConsumer {
         // By pre-locking bundles before they're ready to be processed, it will prevent BankingStage from
         // grabbing those locks so BundleStage can process as fast as possible.
         // A LockedBundle is similar to TransactionBatch; once its dropped the locks are released.
-        // #[allow(clippy::needless_collect)]
-        // let (locked_bundle_results, locked_bundles_elapsed) = measure!(
-        //     bundles
-        //         .iter()
-        //         .map(|(_, sanitized_bundle)| {
-        //             self.bundle_account_locker
-        //                 .prepare_locked_bundle(sanitized_bundle, &bank_start.working_bank)
-        //         })
-        //         .collect::<Vec<_>>(),
-        //     "locked_bundles_elapsed"
-        // );
-        // bundle_stage_leader_stats
-        //     .bundle_stage_stats()
-        //     .increment_locked_bundle_elapsed_us(locked_bundles_elapsed.as_us());
-
-        let locked_bundle_results = bundles
-            .iter()
-            .map(|(_, sanitized_bundle)| {
-                self.bundle_account_locker
-                    .prepare_locked_bundle(sanitized_bundle, &bank_start.working_bank)
-            })
-            .collect::<Vec<_>>();
+        #[allow(clippy::needless_collect)]
+        let (locked_bundle_results, locked_bundles_elapsed) = measure!(
+            bundles
+                .iter()
+                .map(|(_, sanitized_bundle)| {
+                    bundle_account_locker
+                        .prepare_locked_bundle(sanitized_bundle, &bank_start.working_bank)
+                })
+                .collect::<Vec<_>>(),
+            "locked_bundles_elapsed"
+        );
+        bundle_stage_leader_stats
+            .bundle_stage_stats()
+            .increment_locked_bundle_elapsed_us(locked_bundles_elapsed.as_us());
 
         // // into_iter so that LockedBundles are dropped, releasing the locks from BankingStage
-        // let _execution_results: Vec<_> = locked_bundle_results
-        //     .into_iter()
-        //     .map(|r| match r {
-        //         Ok(locked_bundle) => self.process_bundle(&locked_bundle, bank_start),
-        //         Err(e) => Err(BundleExecutionError::LockError),
-        //     })
-        //     .collect();
+        let _execution_results: Vec<_> = locked_bundle_results
+            .into_iter()
+            .map(|r| match r {
+                Ok(locked_bundle) => Self::process_bundle(
+                    bundle_account_locker,
+                    tip_manager,
+                    last_tip_updated_slot,
+                    cluster_info,
+                    block_builder_fee_info,
+                    &locked_bundle,
+                    bank_start,
+                ),
+                Err(e) => Err(BundleExecutionError::LockError),
+            })
+            .collect();
 
         // TODO (LB): accumulate the results into the stats
         vec![]
     }
 
     fn process_bundle(
-        &mut self,
+        bundle_account_locker: &BundleAccountLocker,
+        tip_manager: &TipManager,
+        last_tip_updated_slot: &mut Slot,
+        cluster_info: &Arc<ClusterInfo>,
+        block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         locked_bundle: &LockedBundle,
         bank_start: &BankStart,
     ) -> Result<(), BundleExecutionError> {
@@ -231,7 +248,15 @@ impl BundleConsumer {
             return Err(BundleExecutionError::PohMaxHeightError);
         }
 
-        self.handle_tip_programs(locked_bundle, bank_start)?;
+        Self::handle_tip_programs(
+            bundle_account_locker,
+            tip_manager,
+            last_tip_updated_slot,
+            cluster_info,
+            block_builder_fee_info,
+            locked_bundle,
+            bank_start,
+        )?;
 
         // TODO (LB): can cache tip accounts somewhere
 
@@ -240,14 +265,18 @@ impl BundleConsumer {
 
     /// The validator needs to manage state on two programs related to tips
     fn handle_tip_programs(
-        &self,
+        bundle_account_locker: &BundleAccountLocker,
+        tip_manager: &TipManager,
+        last_tip_updated_slot: &mut Slot,
+        cluster_info: &Arc<ClusterInfo>,
+        block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         locked_bundle: &LockedBundle,
         bank_start: &BankStart,
     ) -> Result<(), BundleExecutionError> {
         if !Self::bundle_touches_tip_pdas(
             locked_bundle.sanitized_bundle(),
-            &self.tip_manager.get_tip_accounts(),
-        ) || bank_start.working_bank.slot() == self.last_tip_update_slot
+            &tip_manager.get_tip_accounts(),
+        ) || bank_start.working_bank.slot() == *last_tip_updated_slot
         {
             return Ok(());
         }
@@ -255,12 +284,10 @@ impl BundleConsumer {
         // This will setup the tip payment and tip distribution program if they haven't been
         // initialized yet, which is typically helpful for local validators. On mainnet and testnet,
         // this code should never run.
-        if let Some(bundle) = self
-            .tip_manager
-            .get_initialize_tip_programs_bundle(&bank_start.working_bank, &self.cluster_info)
+        if let Some(bundle) =
+            tip_manager.get_initialize_tip_programs_bundle(&bank_start.working_bank, cluster_info)
         {
-            let locked_bundle = self
-                .bundle_account_locker
+            let locked_bundle = bundle_account_locker
                 .prepare_locked_bundle(&bundle, &bank_start.working_bank)
                 .map_err(|e| BundleExecutionError::TipError(TipPaymentError::LockError))?;
 
@@ -272,75 +299,25 @@ impl BundleConsumer {
         // The other is ensuring the tip_receiver is configured correctly to ensure tips are routed to the correct
         // address. The validator must drain the tip accounts to the previous tip receiver before setting the tip receiver to
         // themselves.
-        let tip_crank_bundle = self
-            .tip_manager
+        let tip_crank_bundle = tip_manager
             .get_tip_programs_crank_bundle(
                 &bank_start.working_bank,
-                &self.cluster_info,
-                &self.block_builder_fee_info.lock().unwrap(),
+                cluster_info,
+                &block_builder_fee_info.lock().unwrap(),
             )
             .map_err(|e| BundleExecutionError::TipError(e))?;
 
         if let Some(bundle) = tip_crank_bundle {
-            let locked_bundle = self
-                .bundle_account_locker
+            let locked_bundle = bundle_account_locker
                 .prepare_locked_bundle(&bundle, &bank_start.working_bank)
                 .map_err(|e| BundleExecutionError::TipError(TipPaymentError::LockError))?;
 
             // TODO (LB): execute it!
         }
 
-        // self.last_tip_update_slot = bank_start.working_bank.slot();
+        *last_tip_updated_slot = bank_start.working_bank.slot();
 
         Ok(())
-    }
-
-    /// When executed the first time, there's some accounts that need to be initialized.
-    /// This is only helpful for local testing, on testnet and mainnet these will never be executed.
-    fn get_initialize_tip_programs_bundle(
-        bank: &Bank,
-        tip_manager: &TipManager,
-        cluster_info: &Arc<ClusterInfo>,
-    ) -> Option<SanitizedBundle> {
-        let maybe_init_tip_payment_config_tx =
-            if tip_manager.should_initialize_tip_payment_program(bank) {
-                info!("building initialize_tip_payment_program_tx");
-                Some(tip_manager.initialize_tip_payment_program_tx(
-                    bank.last_blockhash(),
-                    &cluster_info.keypair(),
-                ))
-            } else {
-                None
-            };
-
-        let maybe_init_tip_distro_config_tx =
-            if tip_manager.should_initialize_tip_distribution_config(bank) {
-                info!("building initialize_tip_distribution_config_tx");
-                Some(
-                    tip_manager
-                        .initialize_tip_distribution_config_tx(bank.last_blockhash(), cluster_info),
-                )
-            } else {
-                None
-            };
-
-        let transactions = [
-            maybe_init_tip_payment_config_tx,
-            maybe_init_tip_distro_config_tx,
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<SanitizedTransaction>>();
-
-        if transactions.is_empty() {
-            None
-        } else {
-            Some(SanitizedBundle {
-                transactions,
-                // TODO (LB): calculate this
-                bundle_id: String::default(),
-            })
-        }
     }
 
     //     #[allow(clippy::too_many_arguments)]
