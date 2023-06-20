@@ -287,6 +287,10 @@ impl BundleConsumer {
         if let Some(bundle) =
             tip_manager.get_initialize_tip_programs_bundle(&bank_start.working_bank, cluster_info)
         {
+            info!(
+                "initializing tip programs with #{} transactions",
+                bundle.transactions.len()
+            );
             let locked_bundle = bundle_account_locker
                 .prepare_locked_bundle(&bundle, &bank_start.working_bank)
                 .map_err(|e| BundleExecutionError::TipError(TipPaymentError::LockError))?;
@@ -308,6 +312,10 @@ impl BundleConsumer {
             .map_err(|e| BundleExecutionError::TipError(e))?;
 
         if let Some(bundle) = tip_crank_bundle {
+            info!(
+                "cranking tip programs with #{} transactions",
+                bundle.transactions.len()
+            );
             let locked_bundle = bundle_account_locker
                 .prepare_locked_bundle(&bundle, &bank_start.working_bank)
                 .map_err(|e| BundleExecutionError::TipError(TipPaymentError::LockError))?;

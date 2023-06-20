@@ -474,7 +474,6 @@ impl TipManager {
     ) -> Option<SanitizedBundle> {
         let maybe_init_tip_payment_config_tx =
             if self.should_initialize_tip_payment_program(bank) {
-                info!("building initialize_tip_payment_program_tx");
                 Some(self.initialize_tip_payment_program_tx(
                     bank.last_blockhash(),
                     &cluster_info.keypair(),
@@ -486,7 +485,6 @@ impl TipManager {
         let maybe_init_tip_distro_config_tx = if self
             .should_initialize_tip_distribution_config(bank)
         {
-            info!("building initialize_tip_distribution_config_tx");
             Some(self.initialize_tip_distribution_config_tx(bank.last_blockhash(), cluster_info))
         } else {
             None
@@ -518,7 +516,6 @@ impl TipManager {
         block_builder_fee_info: &BlockBuilderFeeInfo,
     ) -> Result<Option<SanitizedBundle>> {
         let maybe_init_tip_distro_account_tx = if self.should_init_tip_distribution_account(bank) {
-            info!("initializing TDA for epoch {}", bank.epoch());
             Some(self.initialize_tip_distribution_account_tx(
                 bank.last_blockhash(),
                 bank.epoch(),
@@ -531,10 +528,6 @@ impl TipManager {
         let configured_tip_receiver = self.get_configured_tip_receiver(&bank)?;
         let my_tip_receiver = self.get_my_tip_distribution_pda(bank.epoch());
         let maybe_change_tip_receiver_tx = if configured_tip_receiver != my_tip_receiver {
-            info!(
-                "changing tip receiver from {} to {}",
-                configured_tip_receiver, my_tip_receiver
-            );
             Some(self.change_tip_receiver_and_block_builder_tx(
                 &my_tip_receiver,
                 bank,
