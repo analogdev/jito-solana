@@ -37,6 +37,7 @@ use {
     },
 };
 
+use crate::bundle_consumer::BundleReservedSpace;
 use solana_runtime::bank_forks::BankForks;
 
 mod bundle_packet_deserializer;
@@ -138,61 +139,6 @@ impl BundleStageLoopStats {
     }
 }
 
-struct BundleReservedSpace {
-    current_tx_block_limit: u64,
-    current_bundle_block_limit: u64,
-    initial_allocated_cost: u64,
-    unreserved_ticks: u64,
-}
-
-// impl BundleReservedSpace {
-//     fn reset_reserved_cost(&mut self, working_bank: &Arc<Bank>) {
-//         self.current_tx_block_limit = self
-//             .current_bundle_block_limit
-//             .saturating_sub(self.initial_allocated_cost);
-//
-//         working_bank
-//             .write_cost_tracker()
-//             .unwrap()
-//             .set_block_cost_limit(self.current_tx_block_limit);
-//
-//         debug!(
-//             "slot: {}. cost limits reset. bundle: {}, txn: {}",
-//             working_bank.slot(),
-//             self.current_bundle_block_limit,
-//             self.current_tx_block_limit,
-//         );
-//     }
-//
-//     fn bundle_block_limit(&self) -> u64 {
-//         self.current_bundle_block_limit
-//     }
-//
-//     fn tx_block_limit(&self) -> u64 {
-//         self.current_tx_block_limit
-//     }
-//
-//     fn update_reserved_cost(&mut self, working_bank: &Arc<Bank>) {
-//         if self.current_tx_block_limit != self.current_bundle_block_limit
-//             && working_bank
-//                 .max_tick_height()
-//                 .saturating_sub(working_bank.tick_height())
-//                 < self.unreserved_ticks
-//         {
-//             self.current_tx_block_limit = self.current_bundle_block_limit;
-//             working_bank
-//                 .write_cost_tracker()
-//                 .unwrap()
-//                 .set_block_cost_limit(self.current_tx_block_limit);
-//             debug!(
-//                 "slot: {}. increased tx cost limit to {}",
-//                 working_bank.slot(),
-//                 self.current_tx_block_limit
-//             );
-//         }
-//     }
-// }
-//
 pub struct BundleStage {
     bundle_thread: JoinHandle<()>,
 }
@@ -268,6 +214,19 @@ impl BundleStage {
             VecDeque::with_capacity(1_000),
         );
 
+        // The first 80% of the block, based on poh ticks, has `preallocated_bundle_cost` less compute units.
+        // The last 20% has has full compute so blockspace is maximized if BundleStage is idle.
+        let reserved_space = BundleReservedSpace {
+            current_bundle_block_limit: MAX_BLOCK_UNITS,
+            current_tx_block_limit: MAX_BLOCK_UNITS.saturating_sub(preallocated_bundle_cost),
+            initial_allocated_cost: preallocated_bundle_cost,
+            unreserved_ticks: poh_recorder
+                .read()
+                .unwrap()
+                .ticks_per_slot()
+                .saturating_div(5),
+        };
+
         let consumer = BundleConsumer::new(
             committer,
             poh_recorder.read().unwrap().new_recorder(),
@@ -278,6 +237,7 @@ impl BundleStage {
             block_builder_fee_info.clone(),
             max_bundle_retry_duration,
             cluster_info,
+            reserved_space,
         );
 
         let bundle_thread = Builder::new()
@@ -289,7 +249,6 @@ impl BundleStage {
                     consumer,
                     BUNDLE_STAGE_ID,
                     unprocessed_bundle_storage,
-                    preallocated_bundle_cost,
                     poh_recorder,
                     exit,
                 );
@@ -306,20 +265,10 @@ impl BundleStage {
         mut consumer: BundleConsumer,
         id: u32,
         mut unprocessed_bundle_storage: UnprocessedTransactionStorage,
-        preallocated_bundle_cost: u64,
         poh_recorder: Arc<RwLock<PohRecorder>>,
         exit: Arc<AtomicBool>,
     ) {
         let ticks_per_slot = poh_recorder.read().unwrap().ticks_per_slot();
-
-        // The first 80% of the block, based on poh ticks, has `preallocated_bundle_cost` less compute units.
-        // The last 20% has has full compute so blockspace is maximized if BundleStage is idle.
-        let mut _reserved_space = BundleReservedSpace {
-            current_bundle_block_limit: MAX_BLOCK_UNITS,
-            current_tx_block_limit: MAX_BLOCK_UNITS.saturating_sub(preallocated_bundle_cost),
-            initial_allocated_cost: preallocated_bundle_cost,
-            unreserved_ticks: ticks_per_slot.saturating_div(5),
-        };
 
         let mut last_metrics_update = Instant::now();
 
@@ -425,88 +374,6 @@ impl BundleStage {
         }
     }
 
-    //
-    //     // rollup transaction cost details, eg signature_cost, write_lock_cost, data_bytes_cost and
-    //     // execution_cost from the batch of transactions selected for block.
-    //     fn accumulate_batched_transaction_costs<'a>(
-    //         transactions_costs: impl Iterator<Item = &'a TransactionCost>,
-    //         transaction_results: impl Iterator<Item = &'a transaction::Result<()>>,
-    //     ) -> BatchedTransactionDetails {
-    //         let mut batched_transaction_details = BatchedTransactionDetails::default();
-    //         transactions_costs
-    //             .zip(transaction_results)
-    //             .for_each(|(cost, result)| match result {
-    //                 Ok(_) => {
-    //                     saturating_add_assign!(
-    //                         batched_transaction_details.costs.batched_signature_cost,
-    //                         cost.signature_cost
-    //                     );
-    //                     saturating_add_assign!(
-    //                         batched_transaction_details.costs.batched_write_lock_cost,
-    //                         cost.write_lock_cost
-    //                     );
-    //                     saturating_add_assign!(
-    //                         batched_transaction_details.costs.batched_data_bytes_cost,
-    //                         cost.data_bytes_cost
-    //                     );
-    //                     saturating_add_assign!(
-    //                         batched_transaction_details
-    //                             .costs
-    //                             .batched_builtins_execute_cost,
-    //                         cost.builtins_execution_cost
-    //                     );
-    //                     saturating_add_assign!(
-    //                         batched_transaction_details.costs.batched_bpf_execute_cost,
-    //                         cost.bpf_execution_cost
-    //                     );
-    //                 }
-    //                 Err(transaction_error) => match transaction_error {
-    //                     TransactionError::WouldExceedMaxBlockCostLimit => {
-    //                         saturating_add_assign!(
-    //                             batched_transaction_details
-    //                                 .errors
-    //                                 .batched_retried_txs_per_block_limit_count,
-    //                             1
-    //                         );
-    //                     }
-    //                     TransactionError::WouldExceedMaxVoteCostLimit => {
-    //                         saturating_add_assign!(
-    //                             batched_transaction_details
-    //                                 .errors
-    //                                 .batched_retried_txs_per_vote_limit_count,
-    //                             1
-    //                         );
-    //                     }
-    //                     TransactionError::WouldExceedMaxAccountCostLimit => {
-    //                         saturating_add_assign!(
-    //                             batched_transaction_details
-    //                                 .errors
-    //                                 .batched_retried_txs_per_account_limit_count,
-    //                             1
-    //                         );
-    //                     }
-    //                     TransactionError::WouldExceedAccountDataBlockLimit => {
-    //                         saturating_add_assign!(
-    //                             batched_transaction_details
-    //                                 .errors
-    //                                 .batched_retried_txs_per_account_data_block_limit_count,
-    //                             1
-    //                         );
-    //                     }
-    //                     TransactionError::WouldExceedAccountDataTotalLimit => {
-    //                         saturating_add_assign!(
-    //                             batched_transaction_details
-    //                                 .errors
-    //                                 .batched_dropped_txs_per_account_data_total_limit_count,
-    //                             1
-    //                         );
-    //                     }
-    //                     _ => {}
-    //                 },
-    //             });
-    //         batched_transaction_details
-    //     }
-    //
     //     /// Calculates QoS and reserves compute space for the bundle. If the bundle succeeds, commits
     //     /// the results to the cost tracker. If the bundle fails, rolls back any QoS changes made.
     //     /// Ensure that SanitizedBundle was returned by BundleAccountLocker to avoid parallelism issues

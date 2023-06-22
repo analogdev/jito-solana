@@ -1,5 +1,8 @@
+use itertools::max;
+use solana_measure::measure_us;
 use solana_sdk::bundle::error::TipPaymentError;
 use solana_sdk::bundle::sanitized::derive_bundle_id;
+use solana_sdk::bundle::utils::BundleExecutionResult;
 use solana_sdk::transaction::SanitizedTransaction;
 use {
     crate::{
@@ -38,6 +41,61 @@ use {
 //     pub post_balances: (TransactionBalances, TransactionTokenBalances),
 // }
 
+pub struct BundleReservedSpace {
+    pub(crate) current_tx_block_limit: u64,
+    pub(crate) current_bundle_block_limit: u64,
+    pub(crate) initial_allocated_cost: u64,
+    pub(crate) unreserved_ticks: u64,
+}
+
+// impl BundleReservedSpace {
+//     fn reset_reserved_cost(&mut self, working_bank: &Arc<Bank>) {
+//         self.current_tx_block_limit = self
+//             .current_bundle_block_limit
+//             .saturating_sub(self.initial_allocated_cost);
+//
+//         working_bank
+//             .write_cost_tracker()
+//             .unwrap()
+//             .set_block_cost_limit(self.current_tx_block_limit);
+//
+//         debug!(
+//             "slot: {}. cost limits reset. bundle: {}, txn: {}",
+//             working_bank.slot(),
+//             self.current_bundle_block_limit,
+//             self.current_tx_block_limit,
+//         );
+//     }
+//
+//     fn bundle_block_limit(&self) -> u64 {
+//         self.current_bundle_block_limit
+//     }
+//
+//     fn tx_block_limit(&self) -> u64 {
+//         self.current_tx_block_limit
+//     }
+//
+//     fn update_reserved_cost(&mut self, working_bank: &Arc<Bank>) {
+//         if self.current_tx_block_limit != self.current_bundle_block_limit
+//             && working_bank
+//                 .max_tick_height()
+//                 .saturating_sub(working_bank.tick_height())
+//                 < self.unreserved_ticks
+//         {
+//             self.current_tx_block_limit = self.current_bundle_block_limit;
+//             working_bank
+//                 .write_cost_tracker()
+//                 .unwrap()
+//                 .set_block_cost_limit(self.current_tx_block_limit);
+//             debug!(
+//                 "slot: {}. increased tx cost limit to {}",
+//                 working_bank.slot(),
+//                 self.current_tx_block_limit
+//             );
+//         }
+//     }
+// }
+
 pub struct BundleConsumer {
     committer: Committer,
     transaction_recorder: TransactionRecorder,
@@ -60,6 +118,8 @@ pub struct BundleConsumer {
     max_bundle_retry_duration: Duration,
 
     cluster_info: Arc<ClusterInfo>,
+
+    reserved_space: BundleReservedSpace,
 }
 
 impl BundleConsumer {
@@ -73,6 +133,7 @@ impl BundleConsumer {
         block_builder_fee_info: Arc<Mutex<BlockBuilderFeeInfo>>,
         max_bundle_retry_duration: Duration,
         cluster_info: Arc<ClusterInfo>,
+        reserved_space: BundleReservedSpace,
     ) -> Self {
         Self {
             committer,
@@ -87,6 +148,7 @@ impl BundleConsumer {
             block_builder_fee_info,
             max_bundle_retry_duration,
             cluster_info,
+            reserved_space,
         }
     }
 
@@ -139,6 +201,11 @@ impl BundleConsumer {
                     &mut self.last_tip_update_slot,
                     &self.cluster_info,
                     &self.block_builder_fee_info,
+                    &self.committer,
+                    &self.transaction_recorder,
+                    &self.qos_service,
+                    &self.log_messages_bytes_limit,
+                    self.max_bundle_retry_duration,
                     bundles,
                     bank_start,
                     bundle_stage_leader_stats,
@@ -188,6 +255,11 @@ impl BundleConsumer {
         last_tip_updated_slot: &mut Slot,
         cluster_info: &Arc<ClusterInfo>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
+        committer: &Committer,
+        recorder: &TransactionRecorder,
+        qos_service: &QosService,
+        log_messages_bytes_limit: &Option<usize>,
+        max_bundle_retry_duration: Duration,
         bundles: &[(DeserializedBundlePackets, SanitizedBundle)],
         bank_start: &BankStart,
         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
@@ -221,10 +293,15 @@ impl BundleConsumer {
                     last_tip_updated_slot,
                     cluster_info,
                     block_builder_fee_info,
+                    committer,
+                    recorder,
+                    qos_service,
+                    log_messages_bytes_limit,
+                    max_bundle_retry_duration,
                     &locked_bundle,
                     bank_start,
                 ),
-                Err(e) => Err(BundleExecutionError::LockError),
+                Err(_) => Err(BundleExecutionError::LockError),
             })
             .collect();
 
@@ -238,6 +315,11 @@ impl BundleConsumer {
         last_tip_updated_slot: &mut Slot,
         cluster_info: &Arc<ClusterInfo>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
+        committer: &Committer,
+        recorder: &TransactionRecorder,
+        qos_service: &QosService,
+        log_messages_bytes_limit: &Option<usize>,
+        max_bundle_retry_duration: Duration,
         locked_bundle: &LockedBundle,
         bank_start: &BankStart,
     ) -> Result<(), BundleExecutionError> {
@@ -248,17 +330,37 @@ impl BundleConsumer {
             return Err(BundleExecutionError::PohMaxHeightError);
         }
 
-        Self::handle_tip_programs(
-            bundle_account_locker,
-            tip_manager,
-            last_tip_updated_slot,
-            cluster_info,
-            block_builder_fee_info,
-            locked_bundle,
+        if Self::bundle_touches_tip_pdas(
+            locked_bundle.sanitized_bundle(),
+            &tip_manager.get_tip_accounts(),
+        ) && bank_start.working_bank.slot() != *last_tip_updated_slot
+        {
+            Self::handle_tip_programs(
+                bundle_account_locker,
+                tip_manager,
+                last_tip_updated_slot,
+                cluster_info,
+                block_builder_fee_info,
+                committer,
+                recorder,
+                qos_service,
+                log_messages_bytes_limit,
+                max_bundle_retry_duration,
+                bank_start,
+            )?;
+
+            *last_tip_updated_slot = bank_start.working_bank.slot();
+        }
+
+        Self::update_qos_and_execute_record_commit_bundle(
+            committer,
+            recorder,
+            qos_service,
+            log_messages_bytes_limit,
+            max_bundle_retry_duration,
+            locked_bundle.sanitized_bundle(),
             bank_start,
         )?;
-
-        // TODO (LB): can cache tip accounts somewhere
 
         Ok(())
     }
@@ -270,17 +372,13 @@ impl BundleConsumer {
         last_tip_updated_slot: &mut Slot,
         cluster_info: &Arc<ClusterInfo>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
-        locked_bundle: &LockedBundle,
+        committer: &Committer,
+        recorder: &TransactionRecorder,
+        qos_service: &QosService,
+        log_messages_bytes_limit: &Option<usize>,
+        max_bundle_retry_duration: Duration,
         bank_start: &BankStart,
     ) -> Result<(), BundleExecutionError> {
-        if !Self::bundle_touches_tip_pdas(
-            locked_bundle.sanitized_bundle(),
-            &tip_manager.get_tip_accounts(),
-        ) || bank_start.working_bank.slot() == *last_tip_updated_slot
-        {
-            return Ok(());
-        }
-
         // This will setup the tip payment and tip distribution program if they haven't been
         // initialized yet, which is typically helpful for local validators. On mainnet and testnet,
         // this code should never run.
@@ -291,11 +389,12 @@ impl BundleConsumer {
                 "initializing tip programs with #{} transactions",
                 bundle.transactions.len()
             );
-            let locked_bundle = bundle_account_locker
+            let locked_init_tip_programs_bundle = bundle_account_locker
                 .prepare_locked_bundle(&bundle, &bank_start.working_bank)
                 .map_err(|e| BundleExecutionError::TipError(TipPaymentError::LockError))?;
 
-            // TODO (LB): execute it!
+            // TODO (LB): execute it and map error to tip error
+            // Self::update_qos_and_execute_record_commit_bundle()
         }
 
         // There are two frequently run internal cranks inside the jito-solana validator that have to do with managing MEV tips.
@@ -316,162 +415,40 @@ impl BundleConsumer {
                 "cranking tip programs with #{} transactions",
                 bundle.transactions.len()
             );
-            let locked_bundle = bundle_account_locker
+            let locked_tip_crank_bundle = bundle_account_locker
                 .prepare_locked_bundle(&bundle, &bank_start.working_bank)
                 .map_err(|e| BundleExecutionError::TipError(TipPaymentError::LockError))?;
 
-            // TODO (LB): execute it!
+            // TODO (LB): execute it and map errors to tip error
+            // Self::update_qos_and_execute_record_commit_bundle()
         }
-
-        *last_tip_updated_slot = bank_start.working_bank.slot();
 
         Ok(())
     }
 
-    //     #[allow(clippy::too_many_arguments)]
-    //     fn maybe_initialize_tip_accounts(
-    //         bundle_account_locker: &BundleAccountLocker,
-    //         bank_start: &BankStart,
-    //         cluster_info: &Arc<ClusterInfo>,
-    //         recorder: &TransactionRecorder,
-    //         transaction_status_sender: &Option<TransactionStatusSender>,
-    //         gossip_vote_sender: &ReplayVoteSender,
-    //         qos_service: &QosService,
-    //         tip_manager: &TipManager,
-    //         max_bundle_retry_duration: &Duration,
-    //         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
-    //         reserved_space: &mut BundleReservedSpace,
-    //     ) -> BundleStageResult<()> {
-    //         let initialize_tip_accounts_bundle = SanitizedBundle {
-    //             transactions: Self::get_initialize_tip_accounts_transactions(
-    //                 &bank_start.working_bank,
-    //                 tip_manager,
-    //                 cluster_info,
-    //             )?,
-    //             bundle_id: String::default(),
-    //         };
-    //         if !initialize_tip_accounts_bundle.transactions.is_empty() {
-    //             debug!("initialize tip account");
-    //
-    //             let locked_init_tip_bundle = bundle_account_locker
-    //                 .prepare_locked_bundle(&initialize_tip_accounts_bundle, &bank_start.working_bank)
-    //                 .map_err(|_| BundleExecutionError::LockError)?;
-    //             let result = Self::update_qos_and_execute_record_commit_bundle(
-    //                 locked_init_tip_bundle.sanitized_bundle(),
-    //                 recorder,
-    //                 transaction_status_sender,
-    //                 gossip_vote_sender,
-    //                 qos_service,
-    //                 bank_start,
-    //                 bundle_stage_leader_stats,
-    //                 max_bundle_retry_duration,
-    //                 reserved_space,
-    //             );
-    //
-    //             match &result {
-    //                 Ok(_) => {
-    //                     debug!("initialize tip account: success");
-    //                     bundle_stage_leader_stats
-    //                         .bundle_stage_stats()
-    //                         .increment_num_init_tip_account_ok(1);
-    //                 }
-    //                 Err(e) => {
-    //                     error!("initialize tip account error: {:?}", e);
-    //                     bundle_stage_leader_stats
-    //                         .bundle_stage_stats()
-    //                         .increment_num_init_tip_account_errors(1);
-    //                 }
-    //             }
-    //             result
-    //         } else {
-    //             Ok(())
-    //         }
-    //     }
-    //
-    //     /// change tip receiver, draining tips to the previous tip_receiver in the process
-    //     /// note that this needs to happen after the above tip-related bundle initializes
-    //     /// config accounts because get_configured_tip_receiver relies on an account
-    //     /// existing in the bank
-    //     #[allow(clippy::too_many_arguments)]
-    //     fn maybe_change_tip_receiver(
-    //         bundle_account_locker: &BundleAccountLocker,
-    //         bank_start: &BankStart,
-    //         cluster_info: &Arc<ClusterInfo>,
-    //         recorder: &TransactionRecorder,
-    //         transaction_status_sender: &Option<TransactionStatusSender>,
-    //         gossip_vote_sender: &ReplayVoteSender,
-    //         qos_service: &QosService,
-    //         tip_manager: &TipManager,
-    //         max_bundle_retry_duration: &Duration,
-    //         bundle_stage_leader_stats: &mut BundleStageLeaderStats,
-    //         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
-    //         reserved_space: &mut BundleReservedSpace,
-    //     ) -> BundleStageResult<()> {
-    //         let start_handle_tips = Instant::now();
-    //
-    //         let configured_tip_receiver =
-    //             tip_manager.get_configured_tip_receiver(&bank_start.working_bank)?;
-    //         let my_tip_distribution_pda =
-    //             tip_manager.get_my_tip_distribution_pda(bank_start.working_bank.epoch());
-    //         if configured_tip_receiver != my_tip_distribution_pda {
-    //             info!(
-    //                 "changing tip receiver from {} to {}",
-    //                 configured_tip_receiver, my_tip_distribution_pda
-    //             );
-    //
-    //             let bb_info = block_builder_fee_info.lock().unwrap();
-    //             let change_tip_receiver_tx = tip_manager.change_tip_receiver_and_block_builder_tx(
-    //                 &my_tip_distribution_pda,
-    //                 &bank_start.working_bank,
-    //                 &cluster_info.keypair(),
-    //                 &bb_info.block_builder,
-    //                 bb_info.block_builder_commission,
-    //             )?;
-    //
-    //             let change_tip_receiver_bundle = SanitizedBundle {
-    //                 transactions: vec![change_tip_receiver_tx],
-    //                 bundle_id: String::default(),
-    //             };
-    //             let locked_change_tip_receiver_bundle = bundle_account_locker
-    //                 .prepare_locked_bundle(&change_tip_receiver_bundle, &bank_start.working_bank)
-    //                 .map_err(|_| BundleExecutionError::LockError)?;
-    //             let result = Self::update_qos_and_execute_record_commit_bundle(
-    //                 locked_change_tip_receiver_bundle.sanitized_bundle(),
-    //                 recorder,
-    //                 transaction_status_sender,
-    //                 gossip_vote_sender,
-    //                 qos_service,
-    //                 bank_start,
-    //                 bundle_stage_leader_stats,
-    //                 max_bundle_retry_duration,
-    //                 reserved_space,
-    //             );
-    //
-    //             bundle_stage_leader_stats
-    //                 .bundle_stage_stats()
-    //                 .increment_change_tip_receiver_elapsed_us(
-    //                     start_handle_tips.elapsed().as_micros() as u64
-    //                 );
-    //
-    //             match &result {
-    //                 Ok(_) => {
-    //                     debug!("change tip receiver: success");
-    //                     bundle_stage_leader_stats
-    //                         .bundle_stage_stats()
-    //                         .increment_num_change_tip_receiver_ok(1);
-    //                 }
-    //                 Err(e) => {
-    //                     error!("change tip receiver: error {:?}", e);
-    //                     bundle_stage_leader_stats
-    //                         .bundle_stage_stats()
-    //                         .increment_num_change_tip_receiver_errors(1);
-    //                 }
-    //             }
-    //             result
-    //         } else {
-    //             Ok(())
-    //         }
-    //     }
+    /// Foo
+    fn update_qos_and_execute_record_commit_bundle(
+        committer: &Committer,
+        recorder: &TransactionRecorder,
+        qos_service: &QosService,
+        log_messages_bytes_limit: &Option<usize>,
+        max_bundle_retry_duration: Duration,
+        sanitized_bundle: &SanitizedBundle,
+        bank_start: &BankStart,
+    ) -> BundleExecutionResult<()> {
+        // TODO (LB): reserve blockspace, if not enough then bail
+
+        let (
+            (transaction_qos_cost_results, cost_model_throttled_transactions_count),
+            cost_model_us,
+        ) = measure_us!(qos_service.select_and_accumulate_transaction_costs(
+            &bank_start.working_bank,
+            &sanitized_bundle.transactions,
+            std::iter::repeat(Ok(()))
+        ));
+
+        Ok(())
+    }
 
     /// Returns true if any of the transactions in a bundle mention one of the tip PDAs
     fn bundle_touches_tip_pdas(bundle: &SanitizedBundle, tip_pdas: &HashSet<Pubkey>) -> bool {
